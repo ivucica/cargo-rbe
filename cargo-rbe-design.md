@@ -14,6 +14,7 @@ Goals from the request:
 - Break a project into many concurrent tasks with well-defined inputs and outputs.
 - Keep Cargo as the thing that triggers the build.
 - Take inspiration from non-Bazel REAPI clients (recc, reninja).
+- Stay server-agnostic: any REAPI implementation (cloud or local BuildBuddy, Buildbarn, Buildfarm, NativeLink, custom). Endpoints, headers, TLS, platform properties and results URLs are configuration, never hard-coded.
 
 ## 2. The discarded alternative: export the plan (`--build-plan`) and execute it externally
 
@@ -22,7 +23,7 @@ The obvious alternative is to ask Cargo for its plan, then have an external tool
 1. `--build-plan` no longer exists. Cargo removed the unstable feature entirely in 1.93 (changelog, 2026-01-22). The Cargo team points to plumbing commands, `--unit-graph` and structured logging as its replacements.
 2. The nearest survivor, `--unit-graph`, carries only the unit DAG and per-unit metadata. A plan-driven tool must therefore reimplement rustc command-line construction: flags, `-C metadata`, `extra-filename`, env vars, link args from build scripts. That duplicates Cargo's logic and drifts from it.
 
-The wrapper route lets Cargo keep resolving features, env and flags. It is also the stance cargo-reapi takes: Cargo remains the planner, and the wrapper observes the exact compiler commands Cargo schedules. An early Cargo issue (rust-lang/cargo#7468) argued that this feature will eventually need to live in Cargo proper because it affects how many jobs can run in parallel. That is the upstream path in the rollout (section 12).
+The wrapper route lets Cargo keep resolving features, env and flags. It is also the stance cargo-reapi takes: Cargo remains the planner, and the wrapper observes the exact compiler commands Cargo schedules. An early Cargo issue (rust-lang/cargo#7468) argued that this feature will eventually need to live in Cargo proper because it affects how many jobs can run in parallel. That is the upstream path in the rollout (section 13).
 
 `--unit-graph` is still useful, but as a hint only. Prefetch uses it, together with `cargo metadata`, to pre-upload the toolchain and registry trees before the first action needs them.
 
@@ -43,7 +44,7 @@ I built a small workspace (path deps, a proc macro, a build script, one registry
 - Flags seen: `--error-format=json`, `--json=diagnostic-rendered-ansi,artifacts,future-incompat`, `--emit=dep-info,metadata,link`.
 - dep-info lists the files rustc actually read, including the generated file in `OUT_DIR`. It also records `# env-dep:` lines, including an absolute `CARGO_MANIFEST_DIR` when `env!` is used. That is both the hook for a two-stage lookup and the hazard for path canonicalization.
 
-Not yet verified: SVH equality between metadata-only and full compilation; behavior on current Cargo; BuildBuddy-specific behavior (section 14).
+Not yet verified: SVH equality between metadata-only and full compilation; behavior on current Cargo; Server-specific behavior (section 15).
 
 ## 5. Architecture
 
@@ -64,7 +65,40 @@ The wrapper is just a process spawn per unit, so all state lives in the daemon. 
 
 ## 6. Documentation and user-facing configuration
 
-Users run `cargo build` as before. Configuration is a sketch like this:
+Users run `cargo build` as before. Nothing in the tool is tied to one service. Endpoints, headers, TLS, instance name, platform properties and the results URL are all configuration, because the target may be BuildBuddy (cloud or a local copy), Buildbarn, Buildfarm, NativeLink, a custom CAS plus executor, or something else.
+
+Bazel's flag names are reused where they map cleanly, so an existing `.bazelrc` is easy to translate. We do not import Bazel's toolchain and platform selection flags (`--host_platform`, `--platforms`, `--extra_execution_platforms`, `--crosstool_top`, `--javabase`, `--define` ...). Those select Bazel toolchains. The equivalent here is plain execution properties set on the Action, plus the toolchain declared in the input root or the worker image.
+
+### Flags
+
+Every flag can also be set in config files. Precedence, highest first: CLI flag, environment (`CARGO_RBE_*`), project config, user config.
+
+| Flag | Meaning |
+|---|---|
+| `--config=<name>` | Apply the named config section (like Bazel's `build:<name>`). `[common]` always applies. |
+| `--remote_executor=<url>` | Execution endpoint. `grpcs://` is TLS, `grpc://` is plaintext (for local servers). |
+| `--remote_cache=<url>` | CAS and ActionCache endpoint. Defaults to the executor if unset. |
+| `--remote_instance_name=<s>` | REAPI instance name. |
+| `--remote_header=<name>=<value>` | Repeatable. Sent as gRPC metadata on every call. Any name, any value. |
+| `--remote_timeout=<dur>` | Per-action and per-RPC timeout. |
+| `--remote_default_exec_properties=<k>=<v>` | Repeatable. Platform properties placed on every Action. Names are defined by the server. |
+| `--tls_certificate`, `--tls_client_certificate`, `--tls_client_key` | For self-signed or mTLS servers. |
+| `--remote_download=<minimal\|toplevel\|all>` | Output materialization policy. |
+| `--noremote_upload_local_results` | Read-only cache mode (like Bazel). |
+| `--bes_backend=<url>` | Optional. Build Event Stream endpoint, only for services that have one. |
+| `--results_url=<template>` | Optional. URL template, for example `https://ui.example/invocation/{invocation_id}`. |
+| `-j`, `--jobs` | Passed through to Cargo. |
+
+### Headers and secrets
+
+- Headers are generic `name=value` pairs, repeatable, and accumulate across config files (as repeated Bazel flags do). Names are lowercased for gRPC. Values are never logged and are redacted in the action log.
+- A value may reference its source instead of containing the secret: `@env:NAME` reads an environment variable and `@file:path` reads a file. That suits CI, where the secret arrives as an environment variable.
+- A config file may import another with `import = ["?path"]`, where `?` means ignore if missing. This mirrors `try-import %workspace%/.bazelrc.buildbuddysecrets`, so a gitignored secrets file can hold the key.
+- The same headers are sent to the REAPI services and, if configured, the BES backend. Header content is never assumed to be an API key. It may be a bearer token, a custom auth header, or an instance selector.
+
+### Config file
+
+Cargo reads `.cargo/config.toml`. cargo-rbe reads its own `.cargo-rbe.toml`, checked in and free of secrets:
 
 ```toml
 # .cargo/config.toml
@@ -73,24 +107,50 @@ rustc-wrapper = "cargo-rbe-wrap"
 jobs = 128
 
 # .cargo-rbe.toml
-[remote]
-executor = "grpcs://rbe.example.com"
-platform = { OSFamily = "linux", Arch = "x86_64", container-image = "docker://...@sha256:..." }
-[strategy]
-default   = "remote"       # remote | cache-only | local
-workspace = "local"        # keep incremental for crates you're editing
-download  = "toplevel"     # minimal | toplevel | all
-[paths]
-mode = "canonical"         # or "identity" per package
+import = ["?.cargo-rbe.secrets.toml"]        # optional, gitignored
+
+[common]
+remote_timeout = "3600s"
+remote_download = "toplevel"
+paths = "canonical"                           # or "identity" per package
+
+[config.remote]                               # --config=remote : cache + execution
+remote_executor = "grpcs://rbe.example.com"
+remote_cache    = "grpcs://rbe.example.com"
+remote_instance_name = "main"
+remote_header   = ["x-example-auth=@env:RBE_AUTH"]
+results_url     = "https://ui.example.com/invocation/{invocation_id}"   # optional
+bes_backend     = "grpcs://rbe.example.com"                              # optional
+exec_properties = { OSFamily = "linux", Arch = "x86_64", "container-image" = "docker://...@sha256:..." }
+workspace = "local"                           # keep incremental for crates you are editing
+
+[config.remotecache]                          # --config=remotecache : cache only
+remote_cache = "grpcs://rbe.example.com"
+remote_header = ["x-example-auth=@env:RBE_AUTH"]
+
+[config.local-dev]                            # plaintext local server
+remote_executor = "grpc://localhost:8980"
+remote_cache    = "grpc://localhost:8980"
 ```
 
-Documentation deliverables, written alongside the code rather than at the end:
+```toml
+# .cargo-rbe.secrets.toml  (gitignored)
+[config.remote]
+remote_header = ["x-example-auth=SOME_KEY_HERE"]
+```
+
+All names above (header names, property names, URLs) are placeholders. A flag-compatible `.bazelrc`-style reader (`build:remote --remote_header=...`) is easy to add later because the flag names align, but it is not planned for the first chunks.
+
+### Documentation deliverables
+
+Written alongside the code rather than at the end:
 
 - `README`: quickstart (cache-only first), the same-container requirement, and how to read the JSONL action log.
-- `docs/config.md`: every key above, defaults, and which strategy applies to what.
+- `docs/config.md`: every flag and key above, defaults, and which strategy applies to what.
+- `docs/servers.md`: notes per server implementation (what worked, which API versions, which platform properties), filled in from test results.
 - `docs/hermeticity.md`: path modes, env allowlist, `extra inputs` overrides, and `do_not_cache` policy.
 - `docs/troubleshooting.md`: how to interpret fallback reasons from the action log.
-- `docs/ci.md`: the GitHub Actions setup for BuildBuddy, including secret handling (section 14).
+- `docs/ci.md`: the GitHub Actions setup (section 15), including secret handling.
 
 ## 7. Decomposition into actions
 
@@ -117,7 +177,7 @@ The build-script shim is a new proposal; no prior art for it was found in the so
 +- gen/<pkg>/out/           OUT_DIR from the build-script ActionResult
 ```
 
-The linker, libc and `cc` come from the pinned container image, set as a platform property. This follows reninja's advice to configure inside a container and treat its toolchain as the declared environment. Platform properties belong on the Action itself as of API v2.2. One subdirectory per upstream unit makes a unit's `deps/` a list of stable child digests. Rustc still finds everything through repeated `-L dependency=` flags.
+The linker, libc and `cc` come from the pinned worker image or toolchain, selected through server-defined platform properties (property names differ between servers). This follows reninja's advice to configure inside a container and treat its toolchain as the declared environment. Platform properties belong on the Action itself as of API v2.2. One subdirectory per upstream unit makes a unit's `deps/` a list of stable child digests. Rustc still finds everything through repeated `-L dependency=` flags.
 
 ### Two-stage input scan
 
@@ -145,7 +205,7 @@ Trimming is only unsafe for proc macros that read untracked files and degrade si
 - Keep `output_paths` sorted and deduplicated, because the API requires it for consistent Action hashing.
 - Prefer directory outputs that can feed downstream actions without the client re-uploading Directory protos. Newer API revisions have an output-format option for this; check server support via capabilities (recalled from the proto, not verified).
 - The Remote Asset API maps URIs to CAS digests and lets a server fetch dynamically, which could let servers pull crate sources directly. Support varies by server.
-- Server choice matters: bazel-remote is listed without remote execution, so it fits the cache-only phase but not later ones.
+- Server choice matters, and the tool is server-agnostic. The remote-apis README lists many implementations with differing API version ranges, and bazel-remote is listed without remote execution, so it fits the cache-only phase but not later ones. Capabilities are negotiated at startup rather than assumed.
 
 ## 9. Hermeticity: paths, env, platform
 
@@ -195,7 +255,7 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 - SVH consistency between the metadata and codegen actions.
 - Cross-OS workers (macOS laptop to Linux workers), which this design does not solve.
 - Rustc flag drift across toolchains, so the arg parser must be conservative.
-- BuildBuddy-specific behavior, in particular what is needed for an invocation page (see section 15).
+- Server-specific behavior, such as platform property names, API version gaps, and whether an invocation or results page needs more than REAPI metadata (see section 15).
 
 ## 15. Delivery plan and test harness (requested workflow)
 
@@ -203,7 +263,8 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 - Deliverables are incremental and atomic. Each chunk is presented with `present_files`, and a tarball of the repo state is created and presented with every chunk.
 - Chunks are delivered before hitting token limits, never half-finished.
-- The goal is to get something you can run quickly against real REAPI implementations. You send back results (logs, failures, invocation URLs), and the next chunk is built from them.
+- The goal is to get something you can run quickly against real REAPI implementations. You send back results (logs, failures, URLs if any), and the next chunk is built from them.
+- The tool must work against any REAPI implementation. BuildBuddy is one of several candidates, and its cloud service is only one deployment of it. We are unlikely to test only against that.
 - This document is updated as the design changes. Your requests from this conversation live in this section.
 
 ### Chunk plan
@@ -212,14 +273,18 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 **D1. REAPI smoke test, plus GitHub Actions workflow.**
 
-- A small Rust crate `cargo-rbe` with a `smoke` subcommand. It does the following, printing each step so failures are diagnosable:
+- A small `cargo-rbe` crate with a `smoke` subcommand. It takes the same flags and config as the real tool (section 6), so the smoke test exercises the real configuration path. It does the following, printing each step so failures are diagnosable:
   1. `GetCapabilities`: print supported API versions, digest functions, compressors, and whether execution is enabled.
   2. Upload a trivial Command and an input root to the CAS.
-  3. `Execute` a small remote action (e.g. a shell command printing `uname -a` and an echo). This is the "do one small thing remotely" test of the API itself.
+  3. `Execute` a small remote action (for example a shell command printing `uname -a`). This is the "do one small thing remotely" test of the API itself.
   4. Fetch stdout, stderr and exit code from the ActionResult.
   5. Re-run the identical action and report whether it was served from the action cache.
-  6. Print the invocation ID and, where possible, the invocation URL.
-- A GitHub Actions workflow that runs it against BuildBuddy with the API key from a repository secret (e.g. `BUILDBUDDY_API_KEY`), passed to the client as the `x-buildbuddy-api-key` header against `remote.buildbuddy.io` over TLS, as in reninja's README. The workflow must never echo the key, and forks without the secret must skip the job cleanly.
+  6. Print the invocation ID, and the results URL only if a `results_url` template is configured.
+- Cache-only servers are supported. If `GetCapabilities` says execution is not available, steps 3 to 5 are reported as skipped, and the CAS and ActionCache are still exercised directly (upload, read back, `UpdateActionResult`, `GetActionResult`).
+- Workflow design, with no service hard-coded:
+  - The endpoint comes from a repository variable (for example `RBE_REMOTE_EXECUTOR`). Headers come from secrets, mapped onto environment variables and referenced as `@env:NAME` in the config. Secret and variable names are yours to choose.
+  - The remote job is skipped cleanly when the variable or secret is absent (for example on forks), and never echoes secret values.
+  - Optional second job: start a local REAPI server as a service container in the runner and run the same smoke test against it with no secrets. This lets pull requests exercise execution without any cloud account. Candidate servers include those listed with remote execution support in the remote-apis README (Buildbarn, Buildfarm, BuildBuddy OSS, NativeLink and others). Which one to use is a decision for you, since each needs its own configuration and I have not verified any of those setups.
 
 **D2. Cache-only wrapper.** `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. It includes the two-checkout digest-stability acceptance test and the JSONL action log.
 
@@ -227,21 +292,71 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 Later chunks follow the rollout in section 13.
 
-### Invocation ID and URL: what to expect (to verify, not assumed)
+### Invocation IDs and results URLs
 
-- Remote execution itself does not create an "invocation page". As I understand BuildBuddy, the invocation view is built from Build Event Stream (BES) data, which is a separate backend call from REAPI. reninja's flags suggest the same split: it takes a BES backend and a results URL alongside the remote cache and executor flags.
-- REAPI requests can carry request metadata (a tool invocation ID, action ID, tool name) in a gRPC header. D1 will generate a UUID invocation ID, attach it to every REAPI call, and print the URL pattern `https://app.buildbuddy.io/invocation/<id>`.
-- Whether that URL resolves to a populated page with REAPI metadata alone, or whether a minimal BES stream (started/finished events) must also be sent, is unknown. D1 tests the metadata-only variant first. If the page stays empty, the next chunk adds a minimal BES publisher.
-- BuildBuddy's platform and container-image property names, and whether execution needs a `container-image=docker://...` property, will be checked against real behavior in D1 and fixed from your results.
+These depend on the service, so none of it is hard-coded.
+
+- The tool always generates an invocation ID (a UUID) and attaches it to every REAPI call as request metadata (section 16). Servers may use it for grouping or ignore it.
+- A results URL is printed only if `results_url` is configured. It is a template with `{invocation_id}` (and possibly other placeholders later), so it works for a cloud service, a local copy of a service, or a custom UI. If none is configured, only the ID is printed.
+- Some services build their invocation page from Build Event Stream data rather than from REAPI calls. For those, REAPI metadata alone may not produce a page. If `bes_backend` is configured, a minimal BES publisher (started and finished events) can be added in a later chunk. Whether it is needed is unknown until we see results from a real server, and some servers may have no such page at all.
+- Platform property names (container image and so on) and whether they are required are defined by each server. D1 reports what `GetCapabilities` and the first execution attempt reveal, and these are recorded in `docs/servers.md`.
 
 ### What I need from you after D1
 
-- The workflow run log (or the printed output of `cargo-rbe smoke`).
-- Whether the invocation URL showed anything.
-- The `GetCapabilities` output (API versions, compression, digest functions).
-- Any error text from the remote step, especially container or platform errors.
+- The workflow run log, or the printed output of `cargo-rbe smoke`.
+- Which server implementation and version you ran it against, and whether it was cloud, local or custom.
+- The `GetCapabilities` output (API versions, compression, digest functions, execution enabled).
+- Any error text from the remote step, especially container or platform-property errors.
+- Whether a results URL was configured and, if so, whether it showed anything.
 
-## 16. Sources
+## 16. REAPI surface: which RPCs are used, and for what
+
+Only what is needed is used, introduced in the chunk where it first matters. Everything is negotiated through capabilities, since servers differ in API version (the remote-apis README lists a range of supported versions per server).
+
+| API / RPC | Used for | Chunk |
+|---|---|---|
+| `Capabilities.GetCapabilities` | Discover API versions, digest functions, compressors, whether execution and cache update are allowed | D1 |
+| `ContentAddressableStorage.FindMissingBlobs` | Find which input blobs the server lacks, before any upload | D1 |
+| `ContentAddressableStorage.BatchUpdateBlobs` | Upload many small blobs (Directory and Command protos, small files) in few round trips | D1 |
+| `ContentAddressableStorage.BatchReadBlobs` | Download many small outputs | D1 |
+| `ByteStream.Write` / `Read` | Upload and download large blobs; compressed variants if the server advertises them | D1 |
+| `ActionCache.GetActionResult` | Cache lookup before anything is uploaded | D1 / D2 |
+| `ActionCache.UpdateActionResult` | Publish locally produced results (cache-only mode) | D2 |
+| `Execution.Execute` (and `WaitExecution`) | Run an Action remotely and stream operation updates; reconnect after dropped streams | D1 / D3 |
+| `ContentAddressableStorage.GetTree` | Fetch a directory tree by digest when materializing directory outputs | D3 |
+| Remote Asset API `Fetch` | Optionally let the server fetch crate sources by URI and checksum, if supported | later |
+| Remote Logstream API | Optionally stream stdout and stderr of long-running actions | later |
+| BES `PublishBuildToolEventStream` | Optional invocation reporting, only if `bes_backend` is configured and a server needs it | later, if needed |
+
+Cross-cutting details:
+
+- **Request metadata.** Each call carries the standard request metadata header (tool name and version, invocation ID, action ID). This is how a server can correlate calls into one invocation without BES.
+- **Action shape.** Platform properties go on the Action (API v2.2 and later), and for older servers also on the Command, as the API describes. `output_paths` is used rather than the deprecated output file and directory fields, and requires v2.1 or later, so servers older than that are detected via capabilities and reported as unsupported.
+- **Digest function.** SHA-256 by default, negotiated through capabilities. It must be one the server supports. It is fixed per run, and all digests in a run use the same function.
+- **Retries and timeouts.** Idempotent RPCs (`FindMissingBlobs`, reads, `GetActionResult`) are retried with backoff. Uploads are resumable where ByteStream supports it. `Execute` streams are re-attached with `WaitExecution` when the connection drops.
+- **Cache poisoning rule.** Only successful results are written to the ActionCache. Actions marked non-hermetic are executed with `do_not_cache`.
+
+## 17. Implementation language and proto tooling
+
+Cargo being written in Rust does not force our tool to be. The question is what fits a wrapper that is spawned once per rustc invocation, plus a daemon that does a lot of concurrent gRPC I/O. My assessment of the options:
+
+| Language | For | Against |
+|---|---|---|
+| **Rust** | Users already have the toolchain. Fast process startup, which matters because the wrapper runs once per unit. One static binary. Good async gRPC (tonic and prost). Can share dep-info and rustc-flag parsing with the Rust ecosystem, and is the only realistic option for eventual upstreaming into Cargo. Other REAPI projects exist in Rust (a Rust REAPI server and client code are mentioned in the Cargo issue on this topic, and NativeLink ships its own proto crate). | Smaller REAPI client ecosystem than Go. We generate stubs ourselves. |
+| **Go** | The strongest REAPI ecosystem. The remote-apis repo ships generated Go code in-tree, and reninja, reclient and many tools are Go. Fast startup, easy static binaries. | A second language in a Cargo project's toolchain. No path to upstream into Cargo. Reusing Rust-side parsing would mean reimplementing it. |
+| **Python** | Fastest to prototype. Good for scripting experiments. | Interpreter startup cost on every rustc call, and distribution is awkward (virtualenv, grpcio wheels). Not suitable for the wrapper hot path. |
+
+**Recommendation: Rust**, for both the daemon and the thin wrapper, including the D1 smoke test, so that D1 code is not thrown away. The wrapper-to-daemon boundary (a local socket protocol) keeps the daemon replaceable, so if Go turns out to be better, it can be swapped without redesigning the wrapper. This is a judgment call, and I will go with Go or another language if you prefer. Python is reserved for throwaway experiments and CI glue, if needed at all.
+
+**Proto management.**
+
+- The protos come from `bazelbuild/remote-apis`, plus their dependencies (googleapis, protobuf well-known types). The buf registry hosts the REAPI module you linked, so `buf` can pin it as a dependency.
+- Proposal: pin the protos to a specific commit (vendored snapshot or buf dependency lock), and **check the generated Rust code into the repository**. The remote-apis repo does the same for Go. That way contributors and CI do not need `protoc` or `buf` just to build.
+- Use `buf` as optional tooling for lint, breaking-change checks and regeneration (a `buf.yaml` and `buf.gen.yaml` with prost and tonic plugins), not as a build-time requirement. If we prefer fewer tools, `tonic-build` with vendored protos and `protoc` in a regeneration script is the fallback. Plugin choice is something I would verify when D1 is written.
+- BES and Remote Asset protos are added only when those chunks start, so D1 stays small.
+- As a cross-check during development, any standard REAPI client (for example `grpcurl` against the same endpoint, or Bazel itself) can be used to confirm that a server behaves as the smoke test reports.
+
+## 18. Sources
 
 - bazelbuild/remote-apis: https://github.com/bazelbuild/remote-apis
 - REAPI proto docs (Buf): https://buf.build/bazel/remote-apis/docs/main:build.bazel.remote.execution.v2
