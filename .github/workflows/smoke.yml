@@ -59,6 +59,42 @@ jobs:
         if: always()
         with: { name: report-local-cache-only, path: report.json }
 
+  local-buildbuddy:
+    # Full stack without secrets or cloud accounts: BuildBuddy server + executor + Redis, run
+    # directly on the runner (see scripts/local-buildbuddy.sh). Exercises execution too.
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      LBB_VERSION: v2.325.0
+      LBB_REDIS_PORT: "6380"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: cargo-rbe }
+      - name: Install Redis (binary only; the packaged service is not used)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server && (sudo systemctl stop redis-server || true)
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/local-buildbuddy/bin
+          key: local-buildbuddy-${{ env.LBB_VERSION }}-${{ runner.arch }}
+      - name: Start local BuildBuddy
+        run: scripts/local-buildbuddy.sh start
+      - name: Smoke
+        run: |
+          chmod +x cargo-rbe
+          ./cargo-rbe smoke --remote_executor=grpc://127.0.0.1:1985 --remote_timeout=120s \
+            --results_url='http://localhost:8080/invocation/{invocation_id}' --json-out report.json | tee smoke.log
+          { echo "### cargo-rbe smoke (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -E '^(invocation_id|results_url|\[|summary)' smoke.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Server and executor logs (on failure)
+        if: failure()
+        run: scripts/local-buildbuddy.sh logs
+      - name: Stop
+        if: always()
+        run: scripts/local-buildbuddy.sh stop
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: report-local-buildbuddy, path: "report.json\nsmoke.log" }
+
   remote:
     needs: build
     # Skip when not configured, and for forked PRs (which cannot read secrets).

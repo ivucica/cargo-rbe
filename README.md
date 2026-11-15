@@ -75,9 +75,31 @@ chmod +x bazel-remote && mkdir -p /tmp/brdata
 cargo-rbe smoke --remote_cache=grpc://127.0.0.1:9092
 ```
 
+## Local BuildBuddy stack (cache + execution + BES), no containers
+
+```
+sudo apt-get install -y redis-server curl        # redis binary only
+scripts/local-buildbuddy.sh start                # downloads v2.325.0 once, waits until the executor registers
+cargo-rbe smoke --remote_executor=grpc://127.0.0.1:1985 \
+  --results_url='http://localhost:8080/invocation/{invocation_id}'
+scripts/local-buildbuddy.sh stop
+```
+
+Findings (BuildBuddy v2.325.0, Linux amd64):
+- The plain OSS server binary starts and serves cache/ByteStream/ActionCache/BES, but does **not**
+  implement the Execution service even with `--remote_execution.enable_remote_exec=true`.
+- Execution worked with the release's `*-enterprise-*` server and executor, plus Redis for the
+  scheduler (`--remote_execution.redis_target`). Check BuildBuddy's license terms for those
+  binaries before using them in your own CI. The executor ran with the bare runner (no isolation).
+- On a 1-CPU machine the executor stalled at "Downloading inputs"; setting
+  `--cache.client.filecache_link_parallelism` and `--cache.client.input_download_concurrency`
+  fixed it (the script sets both; which one matters was not isolated).
+- Sending an invocation ID in request metadata is enough for the server to attach the execution
+  to it, but no invocation record or page exists until build events (BES) are published.
+
 ## CI
 
-`.github/workflows/smoke.yml`: a `local-cache-only` job (no secrets) and a `remote` job that runs
+`.github/workflows/smoke.yml`: `local-cache-only` and `local-buildbuddy` jobs (no secrets; the latter runs the full stack above and has **not yet run on GitHub Actions**) and a `remote` job that runs
 only when repository variables/secrets are configured and the PR is not from a fork. Variable
 and secret names are documented at the top of the file.
 
@@ -93,5 +115,6 @@ The protos are Apache-2.0 licensed (bazelbuild/remote-apis, googleapis).
 | Verified | Where |
 |---|---|
 | Builds on Rust 1.91; capabilities, CAS batch, ByteStream, ActionCache round-trip, config layering, header indirection, skip-on-no-Execution | locally, against bazel-remote 2.6.4 (cache-only) |
-| `Execute` / `WaitExecution` path, platform properties, result fetching | **not yet run against any real executor** |
+| Full smoke (6/6 steps): `Execute` with stages QUEUED, CACHE_CHECK, EXECUTING, COMPLETED, output fetch from CAS, second run `cached_result=true` | locally, BuildBuddy v2.325.0 enterprise server + executor + Redis (Linux) |
+| `Execute` on any other server; platform properties; a populated BES invocation page | **not yet** |
 | TLS (`grpcs://`), custom headers on a real service | **not yet** |
