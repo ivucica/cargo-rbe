@@ -1,0 +1,99 @@
+name: smoke
+
+# Server-agnostic. Nothing here names a particular REAPI service.
+#
+# Repository *variables* (Settings > Secrets and variables > Actions > Variables), all optional
+# except RBE_REMOTE_EXECUTOR or RBE_REMOTE_CACHE for the "remote" job to run:
+#   RBE_REMOTE_EXECUTOR   e.g. grpcs://rbe.example.com
+#   RBE_REMOTE_CACHE      defaults to the executor if empty
+#   RBE_INSTANCE_NAME     REAPI instance name, may be empty
+#   RBE_EXEC_PROPERTIES   one key=value per line (platform properties; names defined by your server)
+#   RBE_RESULTS_URL       template, e.g. https://ui.example.com/invocation/{invocation_id}
+# Repository *secret*:
+#   RBE_HEADERS           one or more "name=value" lines sent as gRPC metadata (any header names)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        description: "Reuse a nonce to test cache hits across runs (optional)"
+        required: false
+  pull_request:
+    paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-rbe
+          path: target/release/cargo-rbe
+
+  local-cache-only:
+    # No secrets, no cloud account: runs the cache/ByteStream/ActionCache steps against a local
+    # cache-only REAPI server (bazel-remote). Execution is reported as skipped.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: cargo-rbe }
+      - name: Start local cache-only server
+        run: |
+          curl -fsSL -o bazel-remote https://github.com/buchgr/bazel-remote/releases/download/v2.6.4/bazel-remote-2.6.4-linux-amd64
+          chmod +x bazel-remote cargo-rbe
+          mkdir -p /tmp/brdata
+          nohup ./bazel-remote --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
+          sleep 3
+      - name: Smoke
+        run: ./cargo-rbe smoke --remote_cache=grpc://127.0.0.1:9092 --json-out report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: report-local-cache-only, path: report.json }
+
+  remote:
+    needs: build
+    # Skip when not configured, and for forked PRs (which cannot read secrets).
+    if: >-
+      vars.RBE_REMOTE_EXECUTOR != '' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    env:
+      RBE_HEADERS: ${{ secrets.RBE_HEADERS }}
+      RBE_EXEC_PROPERTIES: ${{ vars.RBE_EXEC_PROPERTIES }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: cargo-rbe }
+      - name: Smoke against the configured remote
+        run: |
+          chmod +x cargo-rbe
+          args=(--remote_executor="${{ vars.RBE_REMOTE_EXECUTOR }}")
+          args+=(--remote_cache="${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}")
+          args+=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
+          args+=(--results_url="${{ vars.RBE_RESULTS_URL }}")
+          [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
+          while IFS= read -r line; do
+            [ -n "$line" ] && args+=(--remote_default_exec_properties="$line")
+          done <<< "$RBE_EXEC_PROPERTIES"
+          [ -n "${{ inputs.nonce }}" ] && args+=(--nonce="${{ inputs.nonce }}")
+          set +e
+          ./cargo-rbe smoke "${args[@]}" --json-out report.json | tee smoke.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### cargo-rbe smoke"
+            echo '```'
+            grep -E '^(invocation_id|results_url|\[|summary)' smoke.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: report-remote, path: "report.json\nsmoke.log" }

@@ -1,0 +1,22 @@
+# Copy to .cargo-rbe.toml. Every URL, header and property name below is a placeholder.
+# Secrets never belong in this file: use @env:/@file: references, or a gitignored import.
+import = ["?.cargo-rbe.secrets.toml"]
+
+[common]
+remote_timeout = "600s"
+
+[config.remote]                    # cache + execution
+remote_executor = "grpcs://rbe.example.com"
+remote_cache    = "grpcs://rbe.example.com"
+remote_instance_name = ""
+remote_header   = ["x-example-auth=@env:RBE_AUTH"]       # any header name, any value source
+results_url     = "https://ui.example.com/invocation/{invocation_id}"   # optional
+exec_properties = { OSFamily = "linux", Arch = "x86_64" } # names are defined by your server
+
+[config.remotecache]               # cache only
+remote_cache  = "grpcs://rbe.example.com"
+remote_header = ["x-example-auth=@env:RBE_AUTH"]
+
+[config.local-dev]                 # plaintext local server
+remote_executor = "grpc://localhost:8980"
+remote_cache    = "grpc://localhost:8980"

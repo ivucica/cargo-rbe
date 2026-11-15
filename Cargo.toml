@@ -1,0 +1,28 @@
+[package]
+name = "cargo-rbe"
+version = "0.0.1"
+edition = "2021"
+description = "Remote Execution API (REAPI) client experiments for Cargo builds (D1: smoke test)"
+publish = false
+
+[[bin]]
+name = "cargo-rbe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tonic = { version = "0.12", features = ["tls", "tls-roots", "tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+
+[workspace]
+members = ["tools/protogen"]
