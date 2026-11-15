@@ -286,6 +286,10 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
   - The remote job is skipped cleanly when the variable or secret is absent (for example on forks), and never echoes secret values.
   - Optional second job: start a local REAPI server as a service container in the runner and run the same smoke test against it with no secrets. This lets pull requests exercise execution without any cloud account. Candidate servers include those listed with remote execution support in the remote-apis README (Buildbarn, Buildfarm, BuildBuddy OSS, NativeLink and others). Which one to use is a decision for you, since each needs its own configuration and I have not verified any of those setups.
 
+**D1.1. Local BuildBuddy stack** (done): script and CI job for cache, execution and BES locally, with no secrets.
+
+**D1.2 (proposed). Minimal BES publisher**, only if you want invocation pages on servers that build them from build events.
+
 **D2. Cache-only wrapper.** `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. It includes the two-checkout digest-stability acceptance test and the JSONL action log.
 
 **D3. Remote execution of one real rustc unit** (a registry dependency such as `cfg-if`), with eager downloads.
@@ -304,6 +308,21 @@ Verified in the sandbox (Rust 1.91, against bazel-remote 2.6.4, a cache-only ser
 - From the pinned protos: `Command.output_directory_format` exists (section 8), and the request-metadata header is `build.bazel.remote.execution.v2.requestmetadata-bin` (section 16).
 
 Not verified (needs your runs): `Execute`/`WaitExecution` against a real executor, platform property handling, TLS and custom headers on a real service, and anything about results pages.
+
+### D1.1 status (delivered 2026-11-15): local BuildBuddy stack
+
+Contents: `cargo-rbe-D1.1.tar.gz` (D1 plus `scripts/local-buildbuddy.sh` and a `local-buildbuddy` CI job).
+
+Verified in the sandbox against BuildBuddy v2.325.0 (Linux amd64, no containers):
+
+- All six smoke steps pass, including `Execute` (stages QUEUED, CACHE_CHECK, EXECUTING, COMPLETED), fetching `out.txt` from the CAS, and a second identical `Execute` answered with `cached_result=true`. This closes the main gap left by D1.
+- The plain OSS `buildbuddy-linux-amd64` binary does not implement the Execution service, even with `--remote_execution.enable_remote_exec=true`. Execution needed the `*-enterprise-*` server and executor from the same release, plus Redis (`--remote_execution.redis_target`) for the scheduler. The executor ran with the bare runner (no isolation), which is fine for local testing only. License terms for the enterprise binaries should be checked before relying on them in CI.
+- Capabilities advertised by this server: API 2.0 to 2.11, SHA256/SHA384/SHA512/SHA1/BLAKE3, IDENTITY and ZSTD compression, max batch 4 MB, execution enabled.
+- On a 1-CPU machine the executor stalled at "Downloading inputs" (goroutine dump showed an errgroup that never started workers). Setting `--cache.client.filecache_link_parallelism` and `--cache.client.input_download_concurrency` fixed it. The script sets both; I did not isolate which one matters.
+- Invocation IDs: the server linked the execution to the invocation ID sent in request metadata (one row in its `Executions` table), but created no invocation record, so no populated invocation page exists until build events are published. A minimal BES publisher (started and finished events) is therefore the way to get a visible invocation page on this server, and is proposed as D1.2.
+- The `local-buildbuddy` CI job is written but has not run on GitHub Actions yet.
+
+Not evaluated: lighter alternatives (for example NativeLink or Buildbarn). BuildBuddy needs three processes plus Redis and about 780 MB of downloads (cached in CI), so a lighter stack that offers execution would still be worth a look, but none was tried.
 
 ### Invocation IDs and results URLs
 
