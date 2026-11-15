@@ -292,6 +292,19 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 Later chunks follow the rollout in section 13.
 
+### D1 status (delivered 2026-11-15)
+
+Contents: `cargo-rbe-D1.tar.gz` (crate, checked-in generated stubs, pinned protos, workflow, README, example config).
+
+Verified in the sandbox (Rust 1.91, against bazel-remote 2.6.4, a cache-only server):
+
+- Clean build from the tarball with `--locked`.
+- `GetCapabilities` (that server reports API 2.0 to 2.3, SHA256, ZSTD, no execution), CAS batch calls with deduplication, ByteStream write and read of about 1 MiB, ActionCache update and get.
+- Config layering (`[common]`, `--config`, imports with `?`, environment, CLI), `@env:` and whole-spec header sources, unknown-config and missing-secret errors, and a clean skip when a server has no Execution service.
+- From the pinned protos: `Command.output_directory_format` exists (section 8), and the request-metadata header is `build.bazel.remote.execution.v2.requestmetadata-bin` (section 16).
+
+Not verified (needs your runs): `Execute`/`WaitExecution` against a real executor, platform property handling, TLS and custom headers on a real service, and anything about results pages.
+
 ### Invocation IDs and results URLs
 
 These depend on the service, so none of it is hard-coded.
@@ -346,7 +359,7 @@ Cargo being written in Rust does not force our tool to be. The question is what 
 | **Go** | The strongest REAPI ecosystem. The remote-apis repo ships generated Go code in-tree, and reninja, reclient and many tools are Go. Fast startup, easy static binaries. | A second language in a Cargo project's toolchain. No path to upstream into Cargo. Reusing Rust-side parsing would mean reimplementing it. |
 | **Python** | Fastest to prototype. Good for scripting experiments. | Interpreter startup cost on every rustc call, and distribution is awkward (virtualenv, grpcio wheels). Not suitable for the wrapper hot path. |
 
-**Recommendation: Rust**, for both the daemon and the thin wrapper, including the D1 smoke test, so that D1 code is not thrown away. The wrapper-to-daemon boundary (a local socket protocol) keeps the daemon replaceable, so if Go turns out to be better, it can be swapped without redesigning the wrapper. This is a judgment call, and I will go with Go or another language if you prefer. Python is reserved for throwaway experiments and CI glue, if needed at all.
+**Recommendation: Rust**, for both the daemon and the thin wrapper, including the D1 smoke test, so that D1 code is not thrown away. The wrapper-to-daemon boundary (a local socket protocol) keeps the daemon replaceable, so if Go turns out to be better, it can be swapped without redesigning the wrapper. This is a judgment call. **Decision (user):** start with Rust, treated as an experiment, since it may be more than the problem needs. A Go implementation of the same smoke test and cache-only wrapper is planned afterwards as a comparison, using the same config and flags (section 6), so the two can be judged on real results rather than guesses. Python is reserved for throwaway experiments and CI glue, if needed at all.
 
 **Proto management.**
 
