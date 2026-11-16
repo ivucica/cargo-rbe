@@ -86,6 +86,8 @@ Every flag can also be set in config files. Precedence, highest first: CLI flag,
 | `--remote_download=<minimal\|toplevel\|all>` | Output materialization policy. |
 | `--noremote_upload_local_results` | Read-only cache mode (like Bazel). |
 | `--bes_backend=<url>` | Optional. Build Event Stream endpoint, only for services that have one. |
+| `--bes_header=<name>=<value>` | Repeatable. Extra headers for the BES connection only; BES also receives every `--remote_header`. |
+| `--build_metadata=<KEY>=<VALUE>` | Repeatable. Published in the BuildMetadata event (for example `VISIBILITY=PUBLIC`). |
 | `--results_url=<template>` | Optional. URL template, for example `https://ui.example/invocation/{invocation_id}`. |
 | `-j`, `--jobs` | Passed through to Cargo. |
 
@@ -288,7 +290,7 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 **D1.1. Local BuildBuddy stack** (done): script and CI job for cache, execution and BES locally, with no secrets.
 
-**D1.2 (proposed). Minimal BES publisher**, only if you want invocation pages on servers that build them from build events.
+**D1.2. Minimal BES publisher** (done): publishes the smoke run as an invocation so servers that build pages from build events have a record.
 
 **D2. Cache-only wrapper.** `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. It includes the two-checkout digest-stability acceptance test and the JSONL action log.
 
@@ -324,13 +326,43 @@ Verified in the sandbox against BuildBuddy v2.325.0 (Linux amd64, no containers)
 
 Not evaluated: lighter alternatives (for example NativeLink or Buildbarn). BuildBuddy needs three processes plus Redis and about 780 MB of downloads (cached in CI), so a lighter stack that offers execution would still be worth a look, but none was tried.
 
+### Field results for D1 and D1.1 (reported 2026-11-16)
+
+Received from your runs (GitHub Actions and a local Linux host):
+
+- `local-cache-only`: 4 ok, 1 skipped, as expected, twice (two runs).
+- `local-buildbuddy` on a GitHub-hosted runner: 6 ok. Execution reached the executor, stages QUEUED, CACHE_CHECK, EXECUTING, COMPLETED, in about 24 ms, then `cached_result=true` in under 1 ms.
+- `remote` against BuildBuddy cloud (`grpcs://remote.buildbuddy.io`): 6 ok, twice. Capabilities were identical to the local server (API 2.0 to 2.11, five digest functions, IDENTITY and ZSTD, execution enabled, no node properties). The first execution took 0.7 to 1.1 s, the repeat 60 to 100 ms with `cached_result=true`. The worker was a Linux container, so a default `/bin/sh` and `uname` need no platform properties there.
+- Local host, same stack: all six steps ok, plus the screenshot and console log of the "Invocation not found!" page.
+
+What this settles: the `Execute`/`WaitExecution` path, header and TLS handling against a real service, and the cache-hit behavior work on both a local and a cloud BuildBuddy. Still unseen: any server other than BuildBuddy (and bazel-remote for cache only), and non-default platform properties.
+
+Why the page said "Invocation not found!": the page asks the server for an invocation record. The server only creates one from build events. Our REAPI calls carried the invocation ID in request metadata, which was enough for the server to link the execution to that ID (one row in its executions table) but not to create the invocation. No events were published, so there was nothing to show. D1.2 publishes them.
+
+### D1.2 status (delivered 2026-11-16): minimal BES publisher
+
+Contents: `cargo-rbe-D1.2.tar.gz`. New: `src/bes.rs`, pinned BES protos (googleapis build v1 and Bazel 9.3.2 `build_event_stream.proto` with its imports), `--bes_header`, `--build_metadata`, a `bes` smoke step, unit tests, and the CI changes below.
+
+Verified in the sandbox against local BuildBuddy v2.325.0:
+
+- `bes: published 16 events, 16 acknowledged`.
+- The server now has an invocation record for the ID we sent: command `smoke`, success, exit code `SUCCESS`, and the role taken from `--build_metadata`. Fetching it through the server's own API returned the structured command line, workspace status, build metadata, and an attached `cargo-rbe-report.json`. The console text from the smoke run was stored as a log chunk and read back.
+- A header value passed on the command line (`--remote_header=x-demo=...`) appears nowhere in the server database or logs. Unit tests cover the redaction.
+- Negative cases: a server without BES (bazel-remote) gives `[FAIL] bes` with the server's `Unimplemented` messages and exit code 1; an unreachable endpoint gives `could not connect to bes_backend`.
+
+Not verified: the page in a browser (no browser in the sandbox; the data the page loads is confirmed), BES on BuildBuddy cloud (headers apply to BES, but untested there), any other BES server.
+
+Design choices worth knowing: lifecycle events are best effort because a BES server may implement only the tool stream; progress events are emitted one step behind so each can declare the next as its child, and a final empty progress event closes the chain; the command line is redacted before publishing; the CI keys (`ROLE`, `REPO_URL`, `COMMIT_SHA`, `BRANCH_NAME`) are added only under GitHub Actions.
+
+CI changes in the same chunk (your caching request): the toolchain is pinned to 1.91 and `~/.rustup` plus `~/.cargo/bin` are cached under a key that names that version, so the key describes its contents (`actions/cache` never overwrites an existing key, so a floating `stable` would either freeze or thrash). `~/.cargo/registry` and `target/` are cached under a key with the Cargo.lock hash and a prefix fallback; source-only changes reuse the entry, which still saves the dependency builds. The bazel-remote binary is cached and its download is skipped when present and executable; the asset architecture now comes from `uname -m`, which also fixes the amd64-versus-`runner.arch` mismatch flagged in your review. Unit tests run in the build job. Redis is still installed through apt on each `local-buildbuddy` run, which I left alone because caching apt state is not worth the complexity for one small package.
+
 ### Invocation IDs and results URLs
 
 These depend on the service, so none of it is hard-coded.
 
 - The tool always generates an invocation ID (a UUID) and attaches it to every REAPI call as request metadata (section 16). Servers may use it for grouping or ignore it.
 - A results URL is printed only if `results_url` is configured. It is a template with `{invocation_id}` (and possibly other placeholders later), so it works for a cloud service, a local copy of a service, or a custom UI. If none is configured, only the ID is printed.
-- Some services build their invocation page from Build Event Stream data rather than from REAPI calls. For those, REAPI metadata alone may not produce a page. If `bes_backend` is configured, a minimal BES publisher (started and finished events) can be added in a later chunk. Whether it is needed is unknown until we see results from a real server, and some servers may have no such page at all.
+- Servers that build their invocation page from Build Event Stream data need events as well; REAPI metadata alone only links executions to the ID. If `bes_backend` is configured, the smoke test publishes them (D1.2). Some servers may have no such page at all, in which case only the ID is meaningful.
 - Platform property names (container image and so on) and whether they are required are defined by each server. D1 reports what `GetCapabilities` and the first execution attempt reveal, and these are recorded in `docs/servers.md`.
 
 ### What I need from you after D1
@@ -358,7 +390,7 @@ Only what is needed is used, introduced in the chunk where it first matters. Eve
 | `ContentAddressableStorage.GetTree` | Fetch a directory tree by digest when materializing directory outputs | D3 |
 | Remote Asset API `Fetch` | Optionally let the server fetch crate sources by URI and checksum, if supported | later |
 | Remote Logstream API | Optionally stream stdout and stderr of long-running actions | later |
-| BES `PublishBuildToolEventStream` | Optional invocation reporting, only if `bes_backend` is configured and a server needs it | later, if needed |
+| BES `PublishLifecycleEvent` and `PublishBuildToolEventStream` | Optional invocation reporting, only if `bes_backend` is configured | D1.2 (done) |
 
 Cross-cutting details:
 
