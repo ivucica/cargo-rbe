@@ -1,5 +1,6 @@
 .opencode/*
 !.opencode/plans/
+!.opencode/skills/
 # design originals and import tarballs are archived elsewhere (living doc at repo root; tree unpacked from tarballs)
 .opencode/plans/cargo-rbe-design.v*.md
 .opencode/plans/*.tar.gz
@@ -7,3 +8,5 @@
 /tools/protogen/target
 .cargo-rbe.secrets.toml
 *.secrets.toml
+# local D1 verification run artifacts (not committed)
+d1-info/
