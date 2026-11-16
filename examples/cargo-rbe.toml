@@ -11,6 +11,9 @@ remote_cache    = "grpcs://rbe.example.com"
 remote_instance_name = ""
 remote_header   = ["x-example-auth=@env:RBE_AUTH"]       # any header name, any value source
 results_url     = "https://ui.example.com/invocation/{invocation_id}"   # optional
+bes_backend     = "grpcs://rbe.example.com"                              # optional
+bes_header      = []                                                     # extra headers for BES only
+build_metadata  = { VISIBILITY = "PUBLIC" }                              # published in BuildMetadata
 exec_properties = { OSFamily = "linux", Arch = "x86_64" } # names are defined by your server
 
 [config.remotecache]               # cache only

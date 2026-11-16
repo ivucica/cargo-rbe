@@ -2,15 +2,19 @@ name: smoke
 
 # Server-agnostic. Nothing here names a particular REAPI service.
 #
-# Repository *variables* (Settings > Secrets and variables > Actions > Variables), all optional
-# except RBE_REMOTE_EXECUTOR or RBE_REMOTE_CACHE for the "remote" job to run:
+# Repository *variables* (Settings > Secrets and variables > Actions > Variables). The "remote"
+# job runs only when RBE_REMOTE_EXECUTOR is set; everything else is optional:
 #   RBE_REMOTE_EXECUTOR   e.g. grpcs://rbe.example.com
 #   RBE_REMOTE_CACHE      defaults to the executor if empty
 #   RBE_INSTANCE_NAME     REAPI instance name, may be empty
 #   RBE_EXEC_PROPERTIES   one key=value per line (platform properties; names defined by your server)
+#   RBE_BES_BACKEND       Build Event Stream endpoint; set it to get an invocation page on servers
+#                         that build one from events (usually the same host as the executor)
+#   RBE_BUILD_METADATA    one KEY=VALUE per line, published in the BuildMetadata event
 #   RBE_RESULTS_URL       template, e.g. https://ui.example.com/invocation/{invocation_id}
 # Repository *secret*:
-#   RBE_HEADERS           one or more "name=value" lines sent as gRPC metadata (any header names)
+#   RBE_HEADERS           one or more "name=value" lines sent as gRPC metadata (any header names);
+#                         applied to cache, execution and BES
 
 on:
   workflow_dispatch:
@@ -19,28 +23,43 @@ on:
         description: "Reuse a nonce to test cache hits across runs (optional)"
         required: false
   pull_request:
-    paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**"]
+    paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**", "scripts/**"]
 
 permissions:
   contents: read
 
+env:
+  # Pinned so cache keys describe their contents (D1 was verified on 1.91). Bump deliberately.
+  RUST_VERSION: "1.91"
+  BAZEL_REMOTE_VERSION: "2.6.4"
+  LBB_VERSION: "v2.325.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      RUST_VERSION: "1.91"
     steps:
       - uses: actions/checkout@v4
-      - name: Rust toolchain cache
+
+      # Toolchain cache. actions/cache never overwrites an existing key, so the key must describe
+      # the contents exactly: hence the pinned version above instead of a floating "stable".
+      - name: Cache Rust toolchain
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
             ~/.rustup
-          key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}
-      - name: Install Rust ${{ env.RUST_VERSION }} (pinned so the toolchain cache is deterministic)
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
-      - name: Cargo dependencies and build artifacts cache
+            ~/.cargo/bin
+          key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          cargo --version
+
+      # Dependency and build cache. Saved at job end (post step), only if the job succeeds, so
+      # target/ includes this build. The key changes with Cargo.lock; the restore-keys prefix
+      # gives a partial hit after a dependency bump. Source-only changes reuse the exact entry
+      # (first write wins), which still saves the dependency builds, the expensive part.
+      - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
           path: |
@@ -48,9 +67,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
             target
-          key: cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-release-
+            cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Unit tests
+        run: cargo test --locked
       - name: Build
         run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
@@ -66,31 +88,34 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { name: cargo-rbe }
-      - name: bazel-remote binary cache
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
-          path: ./bazel-remote
-          key: bazel-remote-2.6.4-${{ runner.arch }}
+          path: ~/.cache/bazel-remote
+          key: bazel-remote-${{ env.BAZEL_REMOTE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: Start local cache-only server
         run: |
-          [ -x ./bazel-remote ] || curl -fsSL -o bazel-remote https://github.com/buchgr/bazel-remote/releases/download/v2.6.4/bazel-remote-2.6.4-linux-amd64
-          chmod +x bazel-remote cargo-rbe
+          case "$(uname -m)" in x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) echo "unsupported arch"; exit 1 ;; esac
+          mkdir -p ~/.cache/bazel-remote
+          BR=~/.cache/bazel-remote/bazel-remote
+          if [ ! -x "$BR" ]; then
+            curl -fsSL -o "$BR" "https://github.com/buchgr/bazel-remote/releases/download/v${BAZEL_REMOTE_VERSION}/bazel-remote-${BAZEL_REMOTE_VERSION}-linux-${A}"
+          fi
+          chmod +x "$BR" cargo-rbe
           mkdir -p /tmp/brdata
-          nohup ./bazel-remote --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
+          nohup "$BR" --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
           sleep 3
       - name: Smoke
-        run: ./cargo-rbe smoke --remote_cache=grpc://127.0.0.1:9092 --json-out report.json
+        run: ./cargo-rbe smoke --remote_cache=grpc://127.0.0.1:9092 --json-out report.json | tee smoke.log
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: report-local-cache-only, path: report.json }
+        with: { name: report-local-cache-only, path: "report.json\nsmoke.log" }
 
   local-buildbuddy:
     # Full stack without secrets or cloud accounts: BuildBuddy server + executor + Redis, run
-    # directly on the runner (see scripts/local-buildbuddy.sh). Exercises execution too.
+    # directly on the runner (see scripts/local-buildbuddy.sh). Exercises execution and BES.
     needs: build
     runs-on: ubuntu-latest
     env:
-      LBB_VERSION: v2.325.0
       LBB_REDIS_PORT: "6380"
     steps:
       - uses: actions/checkout@v4
@@ -101,13 +126,14 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/local-buildbuddy/bin
-          key: local-buildbuddy-${{ env.LBB_VERSION }}-${{ runner.arch }}
+          key: local-buildbuddy-${{ env.LBB_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: Start local BuildBuddy
         run: scripts/local-buildbuddy.sh start
-      - name: Smoke
+      - name: Smoke (cache + execution + build events)
         run: |
           chmod +x cargo-rbe
-          ./cargo-rbe smoke --remote_executor=grpc://127.0.0.1:1985 --remote_timeout=120s \
+          ./cargo-rbe smoke --remote_executor=grpc://127.0.0.1:1985 --bes_backend=grpc://127.0.0.1:1985 \
+            --remote_timeout=120s --build_metadata=VISIBILITY=PUBLIC \
             --results_url='http://localhost:8080/invocation/{invocation_id}' --json-out report.json | tee smoke.log
           { echo "### cargo-rbe smoke (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -E '^(invocation_id|results_url|\[|summary)' smoke.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Server and executor logs (on failure)
@@ -130,6 +156,7 @@ jobs:
     env:
       RBE_HEADERS: ${{ secrets.RBE_HEADERS }}
       RBE_EXEC_PROPERTIES: ${{ vars.RBE_EXEC_PROPERTIES }}
+      RBE_BUILD_METADATA: ${{ vars.RBE_BUILD_METADATA }}
     steps:
       - uses: actions/download-artifact@v4
         with: { name: cargo-rbe }
@@ -140,10 +167,14 @@ jobs:
           args+=(--remote_cache="${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}")
           args+=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
           args+=(--results_url="${{ vars.RBE_RESULTS_URL }}")
+          args+=(--bes_backend="${{ vars.RBE_BES_BACKEND }}")
           [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
           while IFS= read -r line; do
             [ -n "$line" ] && args+=(--remote_default_exec_properties="$line")
           done <<< "$RBE_EXEC_PROPERTIES"
+          while IFS= read -r line; do
+            [ -n "$line" ] && args+=(--build_metadata="$line")
+          done <<< "$RBE_BUILD_METADATA"
           [ -n "${{ inputs.nonce }}" ] && args+=(--nonce="${{ inputs.nonce }}")
           set +e
           ./cargo-rbe smoke "${args[@]}" --json-out report.json | tee smoke.log
@@ -151,7 +182,7 @@ jobs:
           {
             echo "### cargo-rbe smoke"
             echo '```'
-            grep -E '^(invocation_id|results_url|\[|summary)' smoke.log
+            grep -E '^(invocation_id|results_url|\[|summary|         invocation page)' smoke.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc

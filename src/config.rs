@@ -22,6 +22,10 @@ pub struct Settings {
     pub exec_properties: BTreeMap<String, String>,
     pub results_url: Option<String>,
     pub bes_backend: Option<String>,
+    /// Extra headers for the BES connection only (BES also receives `remote_header`).
+    pub bes_header: Vec<String>,
+    /// Key/values published in the BuildMetadata event.
+    pub build_metadata: BTreeMap<String, String>,
     pub tls_certificate: Option<PathBuf>,
     pub tls_client_certificate: Option<PathBuf>,
     pub tls_client_key: Option<PathBuf>,
@@ -35,7 +39,9 @@ impl Settings {
             bes_backend, tls_certificate, tls_client_certificate, tls_client_key
         );
         self.remote_header.extend(o.remote_header);
+        self.bes_header.extend(o.bes_header);
         self.exec_properties.extend(o.exec_properties);
+        self.build_metadata.extend(o.build_metadata);
     }
 }
 
@@ -51,6 +57,10 @@ struct Section {
     exec_properties: BTreeMap<String, String>,
     results_url: Option<String>,
     bes_backend: Option<String>,
+    #[serde(default)]
+    bes_header: Vec<String>,
+    #[serde(default)]
+    build_metadata: BTreeMap<String, String>,
     tls_certificate: Option<PathBuf>,
     tls_client_certificate: Option<PathBuf>,
     tls_client_key: Option<PathBuf>,
@@ -73,6 +83,8 @@ impl Section {
             exec_properties: self.exec_properties,
             results_url: self.results_url,
             bes_backend: self.bes_backend,
+            bes_header: self.bes_header,
+            build_metadata: self.build_metadata,
             tls_certificate: self.tls_certificate,
             tls_client_certificate: self.tls_client_certificate,
             tls_client_key: self.tls_client_key,
@@ -272,4 +284,37 @@ pub fn expand_header_specs(specs: &[String]) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_header_is_lowercased_and_split_on_first_equals() {
+        assert_eq!(resolve_header("X-Key=a=b").unwrap(), ("x-key".to_string(), "a=b".to_string()));
+    }
+
+    #[test]
+    fn rejects_binary_header_names_and_missing_equals() {
+        assert!(resolve_header("x-bin-bin=1").is_err());
+        assert!(resolve_header("novalue").is_err());
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1500ms").unwrap(), Duration::from_millis(1500));
+        assert!(parse_duration("soon").is_err());
+    }
+
+    #[test]
+    fn overlay_appends_headers_and_overrides_scalars() {
+        let mut a = Settings { remote_executor: Some("a".into()), remote_header: vec!["h1=1".into()], ..Default::default() };
+        let b = Settings { remote_executor: Some("b".into()), remote_header: vec!["h2=2".into()], ..Default::default() };
+        a.overlay(b);
+        assert_eq!(a.remote_executor.as_deref(), Some("b"));
+        assert_eq!(a.remote_header, vec!["h1=1".to_string(), "h2=2".to_string()]);
+    }
 }

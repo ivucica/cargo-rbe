@@ -53,6 +53,9 @@ impl Conn {
     pub fn exec(&self) -> re::execution_client::ExecutionClient<Svc> {
         re::execution_client::ExecutionClient::new(self.svc.clone()).max_decoding_message_size(MAX_MSG)
     }
+    pub fn bes(&self) -> crate::proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient<Svc> {
+        crate::proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient::new(self.svc.clone())
+    }
     pub fn bytestream(&self) -> bs::byte_stream_client::ByteStreamClient<Svc> {
         bs::byte_stream_client::ByteStreamClient::new(self.svc.clone()).max_decoding_message_size(MAX_MSG)
     }

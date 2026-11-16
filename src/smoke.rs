@@ -37,9 +37,18 @@ pub struct Report {
     pub exec_properties: std::collections::BTreeMap<String, String>,
     pub capabilities: serde_json::Value,
     pub steps: Vec<Step>,
+    #[serde(skip)]
+    pub bes: Option<crate::bes::Bes>,
 }
 
 impl Report {
+    /// Print a line and forward it to the BES console output (if publishing).
+    pub async fn log(&mut self, line: String) {
+        println!("{line}");
+        if let Some(b) = self.bes.as_mut() {
+            b.progress(&line).await;
+        }
+    }
     pub fn failed(&self) -> bool {
         self.steps.iter().any(|s| s.status == "FAIL")
     }
@@ -54,7 +63,8 @@ impl Report {
             Ok(Outcome::Skip(d)) => ("skip", d),
             Err(e) => ("FAIL", format!("{e:#}")),
         };
-        println!("[{status:>4}] {name}: {}", detail.replace('\n', "\n         "));
+        let line = format!("[{status:>4}] {name}: {}", detail.replace('\n', "\n         "));
+        self.log(line).await;
         self.steps.push(Step { name: name.into(), status, detail, millis: t.elapsed().as_millis() });
     }
 }
@@ -370,6 +380,7 @@ pub async fn run(
     invocation_id: &str,
     nonce: String,
     results_url: Option<String>,
+    bes: Option<crate::bes::Bes>,
 ) -> Result<Report> {
     let timeout = parse_duration(s.remote_timeout.as_deref().unwrap_or("600s"))?;
     let instance = s.remote_instance_name.clone().unwrap_or_default();
@@ -383,6 +394,7 @@ pub async fn run(
         instance_name: instance.clone(),
         header_names: rpc::header_names(s),
         exec_properties: s.exec_properties.clone(),
+        bes,
         ..Default::default()
     };
     let ctx = Ctx { cache, exec, instance: instance.clone(), platform, nonce };
@@ -411,7 +423,7 @@ pub async fn run(
             Ok(Err(e)) => ("FAIL", format!("{e:#}")),
             Err(_) => ("FAIL", "timed out".into()),
         };
-        println!("[{status:>4}] capabilities: {}", detail.replace('\n', "\n         "));
+        rep.log(format!("[{status:>4}] capabilities: {}", detail.replace('\n', "\n         "))).await;
         rep.steps.push(Step { name: "capabilities".into(), status, detail, millis: t.elapsed().as_millis() });
     }
     if let Some(e) = exec {
@@ -420,13 +432,13 @@ pub async fn run(
             match tokio::time::timeout(timeout, caps_step(e, &instance, "executor")).await {
                 Ok(Ok((Outcome::Ok(d), caps))) => {
                     exec_enabled = caps.execution_capabilities.as_ref().map(|x| x.exec_enabled);
-                    println!("[  ok] capabilities (executor): {}", d.replace('\n', "\n         "));
+                    rep.log(format!("[  ok] capabilities (executor): {}", d.replace('\n', "\n         "))).await;
                     caps_json.insert("exec_endpoint".into(), serde_json::json!({"low": semver(&caps.low_api_version), "high": semver(&caps.high_api_version), "exec_enabled": exec_enabled}));
                     rep.steps.push(Step { name: "capabilities-executor".into(), status: "ok", detail: d, millis: t.elapsed().as_millis() });
                 }
                 other => {
                     let d = match other { Ok(Err(e)) => format!("{e:#}"), _ => "timed out".into() };
-                    println!("[FAIL] capabilities (executor): {d}");
+                    rep.log(format!("[FAIL] capabilities (executor): {d}")).await;
                     rep.steps.push(Step { name: "capabilities-executor".into(), status: "FAIL", detail: d, millis: t.elapsed().as_millis() });
                 }
             }
@@ -453,7 +465,7 @@ pub async fn run(
             if rep.steps.last().map(|s| s.status) == Some("ok") {
                 rep.run("execute-again", timeout, exec_step(&ctx, true)).await;
             } else {
-                println!("[skip] execute-again: first execution did not succeed");
+                rep.log("[skip] execute-again: first execution did not succeed".to_string()).await;
             }
         }
     }

@@ -1,3 +1,4 @@
+mod bes;
 mod config;
 #[allow(clippy::all, dead_code, non_camel_case_types, unused_qualifications)]
 mod proto;
@@ -40,6 +41,12 @@ struct Cli {
     tls_client_key: Option<PathBuf>,
     #[arg(long = "bes_backend", global = true)]
     bes_backend: Option<String>,
+    /// name=value header sent only to the BES backend (BES also receives --remote_header). Repeatable.
+    #[arg(long = "bes_header", global = true)]
+    bes_header: Vec<String>,
+    /// KEY=VALUE published in the BuildMetadata event (e.g. VISIBILITY=PUBLIC). Repeatable.
+    #[arg(long = "build_metadata", global = true)]
+    build_metadata: Vec<String>,
     /// URL template; {invocation_id} is substituted. Printed only if set.
     #[arg(long = "results_url", global = true)]
     results_url: Option<String>,
@@ -75,7 +82,14 @@ fn cli_settings(c: &Cli) -> Result<Settings> {
         let (k, v) = p.split_once('=').ok_or_else(|| anyhow!("--remote_default_exec_properties expects key=value"))?;
         props.insert(k.to_string(), v.to_string());
     }
+    let mut meta = std::collections::BTreeMap::new();
+    for m in c.build_metadata.iter().filter(|m| !m.trim().is_empty()) {
+        let (k, v) = m.split_once('=').ok_or_else(|| anyhow!("--build_metadata expects KEY=VALUE"))?;
+        meta.insert(k.to_string(), v.to_string());
+    }
     Ok(Settings {
+        bes_header: c.bes_header.iter().filter(|h| !h.trim().is_empty()).cloned().collect(),
+        build_metadata: meta,
         remote_executor: nz(&c.remote_executor),
         remote_cache: nz(&c.remote_cache),
         remote_instance_name: nz(&c.remote_instance_name),
@@ -115,7 +129,9 @@ async fn real_main() -> Result<()> {
             println!("remote_timeout: {:?}", s.remote_timeout);
             println!("exec_properties: {:?}", s.exec_properties);
             println!("results_url: {:?}", s.results_url);
-            println!("bes_backend: {:?} (not used by this version)", s.bes_backend);
+            println!("bes_backend: {:?}", s.bes_backend);
+            println!("bes_header names (values hidden): {:?}", rpc::header_names(&Settings { remote_header: s.bes_header.clone(), ..Default::default() }));
+            println!("build_metadata: {:?}", s.build_metadata);
             Ok(())
         }
         Cmd::Smoke(a) => {
@@ -128,9 +144,6 @@ async fn real_main() -> Result<()> {
                 Some(u) => println!("results_url: {u}"),
                 None => println!("results_url: (none configured)"),
             }
-            if s.bes_backend.is_some() {
-                println!("note: bes_backend is configured but this version does not publish build events yet");
-            }
             let cache = rpc::connect(&cache_url, &s, &invocation_id).await?;
             let exec = match &s.remote_executor {
                 Some(u) if *u == cache_url => None, // same endpoint: reuse the cache connection
@@ -139,7 +152,63 @@ async fn real_main() -> Result<()> {
             };
             let same = s.remote_executor.as_deref() == Some(cache_url.as_str());
             let exec_ref: Option<&rpc::Conn> = if same { Some(&cache) } else { exec.as_ref() };
-            let rep = smoke::run(&s, &cache, exec_ref, &invocation_id, nonce, results_url).await?;
+            // Optional BES publishing (invocation page on servers that build it from build events).
+            let mut bes_setup_error: Option<String> = None;
+            let bes = match &s.bes_backend {
+                None => None,
+                Some(url) => {
+                    let mut bs = s.clone();
+                    bs.remote_header.extend(s.bes_header.clone());
+                    match rpc::connect(url, &bs, &invocation_id).await {
+                        Ok(conn) => Some(
+                            bes::Bes::start(
+                                conn,
+                                bes::BesConfig {
+                                    invocation_id: invocation_id.clone(),
+                                    command_line: bes::redact_args(&std::env::args().collect::<Vec<_>>()),
+                                    command: "smoke".into(),
+                                    build_metadata: s.build_metadata.clone(),
+                                    workspace_status: bes::ci_workspace_status(),
+                                },
+                            )
+                            .await?,
+                        ),
+                        Err(e) => {
+                            bes_setup_error = Some(format!("{e:#}"));
+                            None
+                        }
+                    }
+                }
+            };
+            let mut rep = smoke::run(&s, &cache, exec_ref, &invocation_id, nonce, results_url.clone(), bes).await?;
+            if s.bes_backend.is_some() {
+                let t = std::time::Instant::now();
+                let ok_so_far = !rep.failed();
+                let (status, detail) = match (rep.bes.take(), bes_setup_error) {
+                    (Some(b), _) => {
+                        let json = serde_json::to_vec_pretty(&rep)?;
+                        let sum = b.finish(ok_so_far, &json).await;
+                        let hard: Vec<_> = sum.notes.iter().filter(|n| !n.starts_with("lifecycle")).collect();
+                        let d = format!(
+                            "published {} events, {} acknowledged (build_id {}){}",
+                            sum.events_sent,
+                            sum.events_acked,
+                            sum.build_id,
+                            if sum.notes.is_empty() { String::new() } else { format!("\nnotes: {}", sum.notes.join("; ")) }
+                        );
+                        if sum.events_acked < sum.events_sent || !hard.is_empty() { ("FAIL", d) } else { ("ok", d) }
+                    }
+                    (None, Some(e)) => ("FAIL", format!("could not connect to bes_backend: {e}")),
+                    (None, None) => ("skip", "no events published".to_string()),
+                };
+                println!("[{status:>4}] bes: {}", detail.replace('\n', "\n         "));
+                if status == "ok" {
+                    if let Some(u) = &results_url {
+                        println!("         invocation page (if the server builds one from events): {u}");
+                    }
+                }
+                rep.steps.push(smoke::Step { name: "bes".into(), status, detail, millis: t.elapsed().as_millis() });
+            }
             if let Some(p) = a.json_out {
                 std::fs::write(&p, serde_json::to_string_pretty(&rep)?)?;
                 println!("wrote {}", p.display());
