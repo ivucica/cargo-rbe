@@ -189,8 +189,13 @@ Minor note: v4's doc text references `docs/servers.md` ("recorded in docs/server
 - Explore-agent review of staged content: PASS, message unchanged from the user-approved draft. Review notes: the addition also marks D1.1 done and adds a D1.2 bullet in the chunk-plan list (covered by the body's "D1.2 minimal-BES-publisher proposal"); one capabilities-summary line goes beyond log 005 but contradicts nothing there.
 - This completes all import commits, in history order: faa422b (C1), 62dc43c (C2), 9598e03 (D1/C4), d88a61d (C3), e4f626f (housekeeping, real date per user decision), d5640f0 (D1.1/C6), 1d9a206 (v4/C5).
 
+### Post-import: CI caching — DONE
+- User request 2026-11-16 ("Ensure actions/cache captures installing rust and then building our crate; similar after any build steps in smoke tests"): commit 03e70dcbb1778a186e5d2ebe7abd243ee0e33ae7 on master (parent b1db37f), real date Mon Nov 16 00:51:00 2026 +0000. 1 file changed, .github/workflows/smoke.yml +28/−3.
+- Changes: the build job pins Rust to 1.91 (RUST_VERSION env; the version D1 was verified against) and adds actions/cache for ~/.rustup + ~/.cargo/bin (keyed on version+OS) and for cargo registry + target/ (keyed on RUST_VERSION + hashFiles('**/Cargo.lock') with a restore-keys fallback); local-cache-only caches the bazel-remote 2.6.4 binary (version+arch key) and guards its download with an executability check. The local-buildbuddy job already cached its own binaries; the redis apt install was left uncached (small package, not idiomatic for actions/cache).
+- Explore-agent review of staged content: PASS; message unchanged from the user-approved draft. Review finding (pre-existing): the bazel-remote download URL is amd64-only while the new cache key includes runner.arch — harmless on x86_64 ubuntu-latest runners, latent if an arm64 runner is ever used.
+
 ## Progress
-- DONE: all import commits landed with verified source-mtime dates; D1 locally verified (data in gitignored `d1-info/`); skill + plan committed at e4f626f.
+- DONE: all import commits landed with verified source-mtime dates; D1 locally verified (data in gitignored `d1-info/`); skill + plan committed at e4f626f; post-import CI caching committed at 03e70dc (real date).
 - Uncommitted on disk: only this plan file's execution-log updates (re-committed next, R10) and the pre-existing untracked `d1-info.tar.gz` (user's call).
 - Next / deferred: final plan-only re-commit; physical deletion of archived originals (user's call after import); collect Claude-requested data from a D1.1 verification run into `d1.1-info.tar.gz` once such a run exists (local script — parked port issue may need fixing first — or the new GH Actions job after push).
 
