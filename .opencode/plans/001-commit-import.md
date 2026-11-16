@@ -151,6 +151,12 @@ Minor note: v4's doc text references `docs/servers.md` ("recorded in docs/server
 - Staged exactly: `cargo-rbe-design.md` (cp -a of the v3 original; no log bundled with this commit per spec).
 - Explore-agent review of staged content: PASS. Its re-draft became the final message: broadened the unverified list to match the diff (platform property handling, results pages) and recorded the tarball-shipping + clean --locked build facts from the D1 status subsection.
 
+### Housekeeping commit — DONE
+- Commit e4f626fac91246c10815f52abf480b01f66c66e5 on master, real execution date Mon Nov 16 00:14:03 2026 +0000 (no mtime override — this is not an import artifact). 3 files changed, 262 insertions.
+- Staged exactly: `.gitignore` (+ `!.opencode/skills/`, + comment and `d1-info/` exclusion), `.opencode/skills/d1-local-smoke/SKILL.md`, this plan file (first commit of the plan — it is now git-tracked, so per R10 every further on-disk update must be re-committed; a final plan-only re-commit is planned after C5/v4 to record D1.1 and v4 completion).
+- Explore-agent review of staged content: PASS (all message claims verified against staged blobs; check-ignore tests confirm skills tracked and d1-info/ ignored; zero absolute paths/wolfpool mentions). Review agent's non-material re-draft used as final message.
+- Observation: a pre-existing untracked `d1-info.tar.gz` appeared at repo root (not created by opencode; likely user-packed); left untouched, not covered by ignore rules — flagged to user.
+
 ### User decisions recorded during execution (2026-11-15)
 - Staging policy: provenance sources are committed in place from `.opencode/plans/`; claude logs as individual entries; design originals (`cargo-rbe-design.v*.md`) and import tarballs are gitignored, "until later we delete the originals". Root `.gitignore` created at C1 with exactly: `.opencode/*`, `!.opencode/plans/`, a comment line, `.opencode/plans/cargo-rbe-design.v*.md`, `.opencode/plans/*.tar.gz`.
 - Commits are executed by subagents (user instruction after one direct attempt was rejected); the orchestrator dispatches the explore review between staging and commit.
@@ -167,5 +173,24 @@ Minor note: v4's doc text references `docs/servers.md` ("recorded in docs/server
 - Repo-local skill created: `.opencode/skills/d1-local-smoke/SKILL.md` (procedure, expected output, data checklist, BuildBuddy cloud config, hash table for all downloaded artifacts — rust tarball vs official sidecar, bazel-remote and both BuildBuddy enterprise binaries vs GitHub API digests, all MATCH).
 - PARKED ISSUE for D1.1 execution: scripts/local-buildbuddy.sh failed to start its stack against the v2.325.0 enterprise binaries — the server's gRPC listener attempted to bind the monitoring port while --port/--grpc_port appeared ignored; a minimal-flag probe died earlier on "Invalid Remote Execution Redis config" (remote exec is on by default and needs a valid redis target). Also: host port 9090 is occupied by another service here, so LBB_MON_PORT must be set. Root cause unconfirmed — investigate when D1.1 runs.
 - BuildBuddy GitHub Actions instructions were provided to the user (2026-11-15): repo vars RBE_REMOTE_EXECUTOR=grpcs://remote.buildbuddy.io + RBE_RESULTS_URL=https://app.buildbuddy.io/invocation/{invocation_id} (others empty initially), secret RBE_HEADERS=x-buildbuddy-api-key=<key>; corroborated by inspecting the user's yatc .bazelrc (same endpoint; auth via try-imported secrets file, not printed).
-- Next: user pushes the repo and runs .github/workflows/smoke.yml (manual dispatch or PR); then D1.1 unpack commit (+ log 005) awaits go-ahead per protocol.
+- Next (at the time): user pushes the repo and runs .github/workflows/smoke.yml (manual dispatch or PR). Superseded: the D1.1 unpack commit is now DONE — see next section; remaining are the v4 overwrite and the final plan-only re-commit (R10).
+
+### D1.1 unpack — DONE
+- Commit d5640f085f8ead692c0f8c4b02aa3320b788196d on master (parent e4f626f). Author and committer dates both verified = Sun Nov 15 19:44:08 2026 +0000 (= D1.1 tarball mtime). 4 files changed, 260 insertions(+), 2 deletions(-).
+- Staged exactly: `scripts/local-buildbuddy.sh` (new; start/stop/status/logs for a Docker-free local BuildBuddy v2.325.0 server+executor+Redis stack, enterprise binaries from GitHub releases), `.github/workflows/smoke.yml` (+ secret-free `local-buildbuddy` job that installs Redis, caches the binaries, runs the full smoke and uploads report.json + smoke.log), `README.md` (+ "Local BuildBuddy stack (cache + execution + BES), no containers" section documenting the script and the v2.325.0 findings), `.opencode/plans/claude-log-005.md`.
+- The predicted .gitignore clobber happened during extraction and was restored via `git checkout -- .gitignore` before staging (verified not staged). Preserved internal mtimes are Nov 15 17:39–17:40 (per-file tar preservation; commit time = tarball mtime per the directives, not file mtimes).
+- Explore-agent review of staged content: PASS; message unchanged from the user-approved draft. Review note: log 005 also mentions an updated `cargo-rbe-design.md` — that is v4, which lands in the next (final import) commit, so this is consistent with plan order, not a gap.
+- FOLLOW-UP (user request 2026-11-16): once a D1.1 verification run exists (local script or the new GH Actions job), collect the data Claude requested into `d1.1-info.tar.gz`, mirroring d1-info/ for D1: report.json, printed smoke log, server/version, execute error text, results URL outcome. The parked local-script port-binding issue above may need resolving first; otherwise use the GH Actions job after the user pushes.
+- Next: v4 overwrite commit (final import commit) at 2026-11-15T19:44:24Z per protocol; then the final plan-only re-commit (R10).
+
+### C5/v4 — DONE
+- Commit 1d9a2069e8fb325a4f7b86648189f37870c03b16 on master. Author and committer dates both verified = Sun Nov 15 19:44:24 2026 +0000 (= v4 mtime). 1 file changed, cargo-rbe-design.md +19/−0 (pure addition).
+- Staged exactly: `cargo-rbe-design.md` (cp -a of the v4 original; no log bundled per spec — log 005 already committed with D1.1).
+- Explore-agent review of staged content: PASS, message unchanged from the user-approved draft. Review notes: the addition also marks D1.1 done and adds a D1.2 bullet in the chunk-plan list (covered by the body's "D1.2 minimal-BES-publisher proposal"); one capabilities-summary line goes beyond log 005 but contradicts nothing there.
+- This completes all import commits, in history order: faa422b (C1), 62dc43c (C2), 9598e03 (D1/C4), d88a61d (C3), e4f626f (housekeeping, real date per user decision), d5640f0 (D1.1/C6), 1d9a206 (v4/C5).
+
+## Progress
+- DONE: all import commits landed with verified source-mtime dates; D1 locally verified (data in gitignored `d1-info/`); skill + plan committed at e4f626f.
+- Uncommitted on disk: only this plan file's execution-log updates (re-committed next, R10) and the pre-existing untracked `d1-info.tar.gz` (user's call).
+- Next / deferred: final plan-only re-commit; physical deletion of archived originals (user's call after import); collect Claude-requested data from a D1.1 verification run into `d1.1-info.tar.gz` once such a run exists (local script — parked port issue may need fixing first — or the new GH Actions job after push).
 
