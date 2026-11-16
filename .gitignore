@@ -8,5 +8,7 @@
 /tools/protogen/target
 .cargo-rbe.secrets.toml
 *.secrets.toml
-# local D1 verification run artifacts (not committed)
+# local verification run artifacts and scratch (not committed)
 d1-info/
+d*-info.tar.gz
+.playwright-mcp/

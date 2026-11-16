@@ -1,6 +1,6 @@
 ---
 name: d1-local-smoke
-description: "Use when verifying cargo-rbe D1 locally or collecting the report data Claude asked for (trigger keywords: run smoke test, verify D1, bazel-remote local server, cache-only REAPI test, collect D1 report, d1-info). Records the exact procedure used on 2026-11-15 to build the crate and run `cargo-rbe smoke` against a local bazel-remote cache-only server, where artifacts go (d1-info/ at repo root), and what to configure for BuildBuddy cloud."
+description: "Use when verifying cargo-rbe D1 or D1.1 locally or collecting the report data Claude asked for (trigger keywords: run smoke test, verify D1, bazel-remote local server, cache-only REAPI test, collect D1 report, d1-info, d1.1-info, local-buildbuddy, LBB_REDIS_PORT). Records the exact procedure used on 2026-11-15 to build the crate and run `cargo-rbe smoke` against a local bazel-remote cache-only server, where artifacts go (d1-info/ at repo root), what to configure for BuildBuddy cloud, and how to run the D1.1 local BuildBuddy stack via scripts/local-buildbuddy.sh (set LBB_REDIS_PORT when 6379 is busy)."
 ---
 
 # D1 local verification (smoke test against a cache-only server)
@@ -78,11 +78,17 @@ Verification method: `sha256sum` on the local file, compared to the official sid
 (rust) or the GitHub API release asset digest field (`/releases/tags/<tag>` →
 assets[].digest). Always verify before running a downloaded binary.
 
-## Known issue parked for D1.1
+## D1.1 local stack — verified 2026-11-16 (parked issue resolved)
 
-scripts/local-buildbuddy.sh (D1.1 artifact) failed to start its stack against the
-v2.325.0 enterprise binaries on 2026-11-15: the server's gRPC listener attempted to
-bind the monitoring port while --port/--grpc_port appeared ignored; root cause not yet
-confirmed (a minimal-flag probe died earlier on "Invalid Remote Execution Redis
-config", i.e. remote exec is on by default and needs a valid redis target). Investigate
-when D1.1 is executed.
+The port-binding failure observed on 2026-11-15 was environmental, not a script bug:
+on this host port 6379 is held by an unrelated service and the script's default redis
+port collided with it. Starting from the repo root with
+`LBB_REDIS_PORT=6380 scripts/local-buildbuddy.sh start` brings up the full stack
+(server gRPC 1985 / HTTP 8080, executor, redis) in seconds; the script works as committed.
+
+D1.1 smoke run against that stack: all six steps ok, exit 0 — including a real Execute
+(QUEUED→CACHE_CHECK→EXECUTING→COMPLETED, out.txt verified from CAS) and cached_result=true
+on re-run; matches design doc v4's D1.1 status record exactly. The results URL returns an
+"Invocation not found!" page: without build events (BES) the server creates no invocation
+record — identical behavior to production BuildBuddy cloud. Full data in d1.1-info.tar.gz
+at the repo root (report.json, smoke log, notes.md, invocation-page evidence).
