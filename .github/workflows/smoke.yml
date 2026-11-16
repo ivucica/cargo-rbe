@@ -27,10 +27,30 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      RUST_VERSION: "1.91"
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.rustup
+          key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}
+      - name: Install Rust ${{ env.RUST_VERSION }} (pinned so the toolchain cache is deterministic)
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
+      - name: Cargo dependencies and build artifacts cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            target
+          key: cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ env.RUST_VERSION }}-${{ runner.os }}-release-
       - name: Build
         run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
@@ -46,9 +66,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { name: cargo-rbe }
+      - name: bazel-remote binary cache
+        uses: actions/cache@v4
+        with:
+          path: ./bazel-remote
+          key: bazel-remote-2.6.4-${{ runner.arch }}
       - name: Start local cache-only server
         run: |
-          curl -fsSL -o bazel-remote https://github.com/buchgr/bazel-remote/releases/download/v2.6.4/bazel-remote-2.6.4-linux-amd64
+          [ -x ./bazel-remote ] || curl -fsSL -o bazel-remote https://github.com/buchgr/bazel-remote/releases/download/v2.6.4/bazel-remote-2.6.4-linux-amd64
           chmod +x bazel-remote cargo-rbe
           mkdir -p /tmp/brdata
           nohup ./bazel-remote --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
