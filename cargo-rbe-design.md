@@ -292,9 +292,9 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 **D1.2. Minimal BES publisher** (done): publishes the smoke run as an invocation so servers that build pages from build events have a record.
 
-**D2. Cache-only wrapper.** `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. It includes the two-checkout digest-stability acceptance test and the JSONL action log.
+**D2. Cache-only wrapper** (done): `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. Includes the two-checkout acceptance test and the JSONL action log.
 
-**D3. Remote execution of one real rustc unit** (a registry dependency such as `cfg-if`), with eager downloads.
+**D3. Remote execution of one real rustc unit** (a registry dependency such as `cfg-if`), with eager downloads. Proposal: reuse the D2 Action, upload the input tree (package, dependency closure, `OUT_DIR`) and run it on a worker whose image provides the same rustc, then compare the remote outputs with a local build of the same unit.
 
 Later chunks follow the rollout in section 13.
 
@@ -355,6 +355,40 @@ Not verified: the page in a browser (no browser in the sandbox; the data the pag
 Design choices worth knowing: lifecycle events are best effort because a BES server may implement only the tool stream; progress events are emitted one step behind so each can declare the next as its child, and a final empty progress event closes the chain; the command line is redacted before publishing; the CI keys (`ROLE`, `REPO_URL`, `COMMIT_SHA`, `BRANCH_NAME`) are added only under GitHub Actions.
 
 CI changes in the same chunk (your caching request): the toolchain is pinned to 1.91 and `~/.rustup` plus `~/.cargo/bin` are cached under a key that names that version, so the key describes its contents (`actions/cache` never overwrites an existing key, so a floating `stable` would either freeze or thrash). `~/.cargo/registry` and `target/` are cached under a key with the Cargo.lock hash and a prefix fallback; source-only changes reuse the entry, which still saves the dependency builds. The bazel-remote binary is cached and its download is skipped when present and executable; the asset architecture now comes from `uname -m`, which also fixes the amd64-versus-`runner.arch` mismatch flagged in your review. Unit tests run in the build job. Redis is still installed through apt on each `local-buildbuddy` run, which I left alone because caching apt state is not worth the complexity for one small package.
+
+### Field results for D1.2 and fixes (reported 2026-11-16)
+
+Your runs: `local-cache-only` 4 ok and 1 skipped; `local-buildbuddy` 6 ok; `remote` (BuildBuddy cloud) 6 ok and `bes: published 16 events, 16 acknowledged`. The local analysis and screenshot show the invocation page fully populated (command line, workspace status, metadata, console, attached report). This settles BES against both a local and a cloud BuildBuddy.
+
+Observations that led to fixes in this drop:
+
+- **Tool name.** The page showed "bazel v0.0.1 smoke" with an empty "Tool tag". The event stream has no tool-name field; the only tool identity is `OptionsParsed.tool_tag`, which we did not send. We now send `OptionsParsed` with `tool_tag=cargo-rbe`. The leading word "bazel" is chosen by the server's UI and cannot be changed from our side. (REAPI request metadata already carried `tool_name=cargo-rbe`; servers display that on execution and cache views, not on the invocation header.)
+- **Duplicated command in the command line.** The structured command line rendered `smoke -- smoke ...` because the residual section repeated the subcommand. It is now split into executable, command, an options list, and residual. Because the options now arrive as a parsed option list, servers can also derive badges such as "remote execution on" from them (not yet confirmed in a browser).
+- Deprecated-field warnings are silenced where we set those fields on purpose for older servers, and doctests are off for the generated code.
+
+### D2 status (delivered 2026-11-16): cache-only rustc wrapper
+
+Contents: `cargo-rbe-D2.tar.gz`. New: `cargo-rbe-wrap` (the `RUSTC_WRAPPER`), `cargo-rbe cargo ...` (launcher), a persistent stat cache, `examples/sample-ws`, `scripts/two-checkout-test.sh`, a `wrapper-cache-test` CI job, and the wrapper test also in the `local-buildbuddy` job. The README has usage and caveats.
+
+What it does is in the README. Verified in the sandbox (Rust 1.91; bazel-remote 2.6.4 and local BuildBuddy v2.325.0):
+
+- Digest stability: the two cacheable units of the sample (a registry crate and a workspace crate with a build script and `OUT_DIR`) get identical Action digests in two checkouts with different paths and different `CARGO_HOME`s.
+- Publish in checkout A, restore in checkout B (fresh target directory): both units hit; both binaries print the same output; the compiler warning is replayed on the hit; Cargo treats restored units as fresh (no rustc invocations on rebuild).
+- Editing a source file misses and publishes; the same edit in the other checkout hits; the edited code is what runs.
+- Through the launcher with BES against BuildBuddy: 2 units published in one checkout and 2 restored in the other; each cargo invocation appears as a `build` invocation with 16 of 16 events acknowledged.
+- Timings on the tiny sample crates: a hit costs 6 to 8 ms, a local compile 25 to 36 ms, a miss including hashing and upload 57 to 72 ms. These say little about real projects.
+
+Findings while building it, worth recording:
+
+- **Artifacts are not location-independent by default.** The same registry crate compiled under two `CARGO_HOME`s gave `.rmeta` files that differed in 33 bytes (the embedded source path and hashes derived from it). Because dependents' keys include their dependencies' contents, one dependency's difference cascades into misses of everything above it. Remapping the registry prefix (`--remap-path-prefix`) fixes it; the canonical command carries a fixed virtual form of the flag. Workspace crates are not remapped, since that changes the paths users see in their own diagnostics; `.rlib` files (debuginfo) still embed the working directory, which only matters where an rlib is itself a dependency input.
+- **A dependency closure is needed for a sound key.** rustc may load any transitive dependency's metadata from the search path, so an action's inputs are not just its direct `--extern` files. The wrapper records, per built artifact, the closure of its dependencies in a local index, and a unit whose closure is unknown (built before the wrapper saw it) is not cached. A consequence: running the wrapper against an already-built `target/` caches little until a clean build. In the longer run this belongs in the daemon or in a unit graph.
+- **Cargo's own fingerprint is sensitive to registry source paths**, so reusing one `CARGO_HOME` per checkout matters; a test bug of mine (a different `CARGO_HOME` on a rebuild) showed it as "path to the source changed".
+- **A shared target directory breaks the test, not the wrapper.** My own final check ran the acceptance test with `CARGO_TARGET_DIR` exported, so both checkouts shared one target directory, the second never invoked the build script, and the test reported a unit "missing in B". I presented the tarball before investigating; the cause was confirmed, the script now unsets the variable, and an `EXTERNAL_TARGET=1` mode (target directories outside the checkouts) passes all three phases too, which also exercises target-root detection.
+- **Test infrastructure lesson:** deleting a server's data directory under a running server makes the next run fail with "blob not found". It looked like a wrapper bug for a few minutes.
+
+Differences from the design, on purpose: no daemon yet (each wrapper process connects itself and keeps its state on disk; a circuit breaker skips the network for 30 seconds after a failed connect); input hashing is the whole package directory rather than the precise two-stage lookup; only library units are cached; inputs are not uploaded to the CAS (nothing executes them yet), only the Command, Action and outputs. Remote execution of one real rustc unit (D3) needs the input tree and the toolchain on the worker.
+
+Not verified: any real-world project (large dependency graphs, features, proc-macro heavy code, build scripts that probe the system), BuildBuddy cloud for the wrapper, cache eviction behavior, and parallel builds under heavy `-j` (the wrapper is thread-safe by construction: separate processes, atomic file writes, but untested at scale).
 
 ### Invocation IDs and results URLs
 
