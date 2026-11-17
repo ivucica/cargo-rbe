@@ -12,6 +12,7 @@ name: smoke
 #                         that build one from events (usually the same host as the executor)
 #   RBE_BUILD_METADATA    one KEY=VALUE per line, published in the BuildMetadata event
 #   RBE_RESULTS_URL       template, e.g. https://ui.example.com/invocation/{invocation_id}
+#   RBE_RUN_WRAPPER_TEST  set to 'true' to also run the wrapper acceptance test against the cache
 # Repository *secret*:
 #   RBE_HEADERS           one or more "name=value" lines sent as gRPC metadata (any header names);
 #                         applied to cache, execution and BES
@@ -23,7 +24,7 @@ on:
         description: "Reuse a nonce to test cache hits across runs (optional)"
         required: false
   pull_request:
-    paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**", "scripts/**"]
+    paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**", "scripts/**", "examples/**"]
 
 permissions:
   contents: read
@@ -78,7 +79,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cargo-rbe
-          path: target/release/cargo-rbe
+          path: |
+            target/release/cargo-rbe
+            target/release/cargo-rbe-wrap
 
   local-cache-only:
     # No secrets, no cloud account: runs the cache/ByteStream/ActionCache steps against a local
@@ -100,7 +103,7 @@ jobs:
           if [ ! -x "$BR" ]; then
             curl -fsSL -o "$BR" "https://github.com/buchgr/bazel-remote/releases/download/v${BAZEL_REMOTE_VERSION}/bazel-remote-${BAZEL_REMOTE_VERSION}-linux-${A}"
           fi
-          chmod +x "$BR" cargo-rbe
+          chmod +x "$BR" cargo-rbe cargo-rbe-wrap
           mkdir -p /tmp/brdata
           nohup "$BR" --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
           sleep 3
@@ -109,6 +112,41 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: report-local-cache-only, path: "report.json\nsmoke.log" }
+
+  wrapper-cache-test:
+    # D2 acceptance test against a local cache-only server (no secrets): Action digests are stable
+    # across checkouts, units published from one checkout are restored in another.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: cargo-rbe, path: bin }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-remote
+          key: bazel-remote-${{ env.BAZEL_REMOTE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Start local cache-only server
+        run: |
+          case "$(uname -m)" in x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) echo "unsupported arch"; exit 1 ;; esac
+          mkdir -p ~/.cache/bazel-remote
+          BR=~/.cache/bazel-remote/bazel-remote
+          if [ ! -x "$BR" ]; then
+            curl -fsSL -o "$BR" "https://github.com/buchgr/bazel-remote/releases/download/v${BAZEL_REMOTE_VERSION}/bazel-remote-${BAZEL_REMOTE_VERSION}-linux-${A}"
+          fi
+          chmod +x "$BR" bin/cargo-rbe bin/cargo-rbe-wrap
+          mkdir -p /tmp/brdata
+          nohup "$BR" --dir /tmp/brdata --max_size 2 --grpc_address 127.0.0.1:9092 --http_address 127.0.0.1:8080 > br.log 2>&1 &
+          sleep 3
+      - name: Wrapper acceptance test
+        run: |
+          BIN_DIR="$PWD/bin" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:9092 | tee wrapper-test.log
+          { echo "### wrapper acceptance test (local cache-only server)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Wrapper acceptance test, target directories outside the checkouts
+        run: EXTERNAL_TARGET=1 BIN_DIR="$PWD/bin" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:9092 | tee wrapper-test-external-target.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: wrapper-test-local-cache-only, path: "wrapper-test.log\nwrapper-test-external-target.log" }
 
   local-buildbuddy:
     # Full stack without secrets or cloud accounts: BuildBuddy server + executor + Redis, run
@@ -131,11 +169,15 @@ jobs:
         run: scripts/local-buildbuddy.sh start
       - name: Smoke (cache + execution + build events)
         run: |
-          chmod +x cargo-rbe
+          chmod +x cargo-rbe cargo-rbe-wrap
           ./cargo-rbe smoke --remote_executor=grpc://127.0.0.1:1985 --bes_backend=grpc://127.0.0.1:1985 \
             --remote_timeout=120s --build_metadata=VISIBILITY=PUBLIC \
             --results_url='http://localhost:8080/invocation/{invocation_id}' --json-out report.json | tee smoke.log
           { echo "### cargo-rbe smoke (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -E '^(invocation_id|results_url|\[|summary)' smoke.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Wrapper acceptance test against the local BuildBuddy cache
+        run: |
+          BIN_DIR="$PWD" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:1985 | tee wrapper-test.log
+          { echo "### wrapper acceptance test (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Server and executor logs (on failure)
         if: failure()
         run: scripts/local-buildbuddy.sh logs
@@ -144,7 +186,7 @@ jobs:
         run: scripts/local-buildbuddy.sh stop
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: report-local-buildbuddy, path: "report.json\nsmoke.log" }
+        with: { name: report-local-buildbuddy, path: "report.json\nsmoke.log\nwrapper-test.log" }
 
   remote:
     needs: build
@@ -158,11 +200,12 @@ jobs:
       RBE_EXEC_PROPERTIES: ${{ vars.RBE_EXEC_PROPERTIES }}
       RBE_BUILD_METADATA: ${{ vars.RBE_BUILD_METADATA }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: cargo-rbe }
       - name: Smoke against the configured remote
         run: |
-          chmod +x cargo-rbe
+          chmod +x cargo-rbe cargo-rbe-wrap
           args=(--remote_executor="${{ vars.RBE_REMOTE_EXECUTOR }}")
           args+=(--remote_cache="${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}")
           args+=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
@@ -186,6 +229,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
+      # Optional: writes small cache entries for the sample workspace into the configured cache.
+      - name: Wrapper acceptance test against the configured cache
+        if: vars.RBE_RUN_WRAPPER_TEST == 'true'
+        run: |
+          args=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
+          [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
+          BIN_DIR="$PWD" scripts/two-checkout-test.sh --remote-cache "${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}" "${args[@]}" | tee wrapper-test.log
+          { echo "### wrapper acceptance test (configured cache)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: report-remote, path: "report.json\nsmoke.log" }
+        with: { name: report-remote, path: "report.json\nsmoke.log\nwrapper-test.log" }

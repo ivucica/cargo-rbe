@@ -1,4 +1,5 @@
 //! RUSTC_WRAPPER for D2: a cache-only REAPI client for rustc invocations.
+//!
 //! For every `rustc` invocation Cargo schedules, the wrapper builds a canonical REAPI Action
 //! (location-independent command line, allowlisted environment, Merkle input root), asks the
 //! ActionCache for a result, and on a hit restores the outputs and replays rustc's diagnostics.
@@ -12,7 +13,6 @@
 //! Modes (`CARGO_RBE_MODE`): `off`, `digest-only` (compute and log Action digests, no network),
 //! `read-only` (lookup, never publish), `cache` (default).
 #![allow(deprecated)] // deprecated REAPI fields are set on purpose for older servers
-
 
 use crate::config::{self, Settings};
 use crate::proto::build::bazel::remote::execution::v2 as re;
@@ -30,9 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-
 type R<T> = Result<T, String>;
-
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -41,7 +39,6 @@ pub enum Mode {
     ReadOnly,
     Cache,
 }
-
 
 impl Mode {
     pub fn parse(s: &str) -> Option<Mode> {
@@ -58,10 +55,8 @@ impl Mode {
     }
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // paths
-
 
 fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -77,12 +72,10 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-
 fn absolutize(cwd: &Path, s: &str) -> PathBuf {
     let p = Path::new(s);
     normalize(&if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) })
 }
-
 
 pub fn cache_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("CARGO_RBE_CACHE_DIR") {
@@ -94,7 +87,6 @@ pub fn cache_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir());
     base.join("cargo-rbe")
 }
-
 
 /// Replace real path prefixes by stable tokens (and back) in text artifacts (stderr, dep-info).
 fn replace_root(s: &str, from: &str, to: &str) -> String {
@@ -115,20 +107,16 @@ fn replace_root(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-
 fn tokenize_text(s: &str, tokens: &[(String, String)]) -> String {
     tokens.iter().fold(s.to_string(), |acc, (real, tok)| replace_root(&acc, real, tok))
 }
-
 
 fn untokenize_text(s: &str, tokens: &[(String, String)]) -> String {
     tokens.iter().fold(s.to_string(), |acc, (real, tok)| acc.replace(tok.as_str(), real))
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // argument parsing
-
 
 #[derive(Clone, Debug)]
 struct Tok {
@@ -136,14 +124,12 @@ struct Tok {
     value: Option<String>,
 }
 
-
 const LONG_VALUE_FLAGS: &[&str] = &[
     "--crate-name", "--crate-type", "--emit", "--out-dir", "--extern", "--cfg", "--check-cfg", "--edition", "--error-format", "--json",
     "--target", "--cap-lints", "--sysroot", "--remap-path-prefix", "--diagnostic-width", "--color", "--print", "--allow", "--warn",
     "--deny", "--forbid", "--force-warn", "--codegen", "--env-set", "--explain",
 ];
 const SHORT_VALUE_FLAGS: &[&str] = &["-C", "-L", "-l", "-A", "-W", "-D", "-F", "-Z", "-o"];
-
 
 fn tokenize_args(args: &[String]) -> Vec<Tok> {
     let mut out = vec![];
@@ -181,25 +167,20 @@ fn tokenize_args(args: &[String]) -> Vec<Tok> {
     out
 }
 
-
 fn is_compile(args: &[String]) -> bool {
     args.iter().any(|a| a == "--crate-name") && args.iter().any(|a| a.ends_with(".rs")) && !args.iter().any(|a| a.starts_with("--print"))
 }
-
 
 fn quick_field(args: &[String], flag: &str) -> Option<String> {
     tokenize_args(args).into_iter().find(|t| t.flag == flag).and_then(|t| t.value)
 }
 
-
 fn extra_filename(args: &[String]) -> Option<String> {
     tokenize_args(args).into_iter().filter(|t| t.flag == "-C").filter_map(|t| t.value).find_map(|v| v.strip_prefix("extra-filename=").map(|s| s.to_string()))
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // plan: canonical action
-
 
 struct OutSpec {
     name: String,
@@ -207,7 +188,6 @@ struct OutSpec {
     is_depinfo: bool,
     is_artifact: bool, // rlib / rmeta: recorded in the closure index
 }
-
 
 struct Plan {
     action_digest: re::Digest,
@@ -223,13 +203,15 @@ struct Plan {
     components: Value,
     cwd: PathBuf,
     cache_dir: PathBuf,
+    /// Arguments appended to the real rustc invocation (path remapping). Their canonical form is
+    /// already part of the Action.
+    real_extra_args: Vec<String>,
+    remap_target: Option<(PathBuf, String)>,
 }
-
 
 fn is_cargo_cachedir(p: &Path) -> bool {
     p.join("CACHEDIR.TAG").exists()
 }
-
 
 fn dir_digest(sc: &mut StatCache, dir: &Path, excludes: &[PathBuf], count: &mut usize) -> R<re::Digest> {
     let mut entries: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
@@ -263,11 +245,9 @@ fn dir_digest(sc: &mut StatCache, dir: &Path, excludes: &[PathBuf], count: &mut 
     Ok(digest_of(&d.encode_to_vec()))
 }
 
-
 fn closure_path(cache: &Path, hash: &str) -> PathBuf {
     cache.join("closure").join(format!("{hash}.json"))
 }
-
 
 fn read_closure(cache: &Path, hash: &str) -> Option<Vec<(String, re::Digest)>> {
     let v: Value = serde_json::from_slice(&std::fs::read(closure_path(cache, hash)).ok()?).ok()?;
@@ -276,7 +256,6 @@ fn read_closure(cache: &Path, hash: &str) -> Option<Vec<(String, re::Digest)>> {
         .map(|e| Some((e["name"].as_str()?.to_string(), re::Digest { hash: e["hash"].as_str()?.to_string(), size_bytes: e["size"].as_i64()? })))
         .collect()
 }
-
 
 fn write_closure(cache: &Path, hash: &str, closure: &BTreeMap<String, re::Digest>) {
     let v: Vec<Value> = closure.iter().map(|(n, d)| json!({"name": n, "hash": d.hash, "size": d.size_bytes})).collect();
@@ -289,7 +268,6 @@ fn write_closure(cache: &Path, hash: &str, closure: &BTreeMap<String, re::Digest
         let _ = std::fs::rename(&tmp, &p);
     }
 }
-
 
 /// Run `rustc -vV` (not through the wrapper). The launcher exports the result once per build.
 fn rustc_identity(rustc: &Path) -> R<String> {
@@ -305,17 +283,14 @@ fn rustc_identity(rustc: &Path) -> R<String> {
     Ok(sha256_hex(&out.stdout))
 }
 
-
 pub fn rustc_identity_for_launcher() -> Option<String> {
     let rustc = std::env::var_os("RUSTC").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rustc"));
     let out = Command::new(rustc).arg("-vV").output().ok()?;
     out.status.success().then(|| sha256_hex(&out.stdout))
 }
 
-
 fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: &Settings) -> R<Plan> {
     let toks = tokenize_args(args);
-
 
     // ---- scan
     let (mut crate_name, mut crate_types, mut emit) = (None, vec![], vec![]);
@@ -362,7 +337,6 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     }
     let manifest_dir = normalize(Path::new(&std::env::var("CARGO_MANIFEST_DIR").map_err(|_| "CARGO_MANIFEST_DIR not set (not run by Cargo?)".to_string())?));
 
-
     // ---- roots
     let mut target_root = out_dir.clone();
     for _ in 0..(if has_target { 3 } else { 2 }) {
@@ -390,10 +364,8 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     add(Some(&cwd.to_path_buf()), "@CWD@");
     tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-
     let source_abs = absolutize(cwd, &source);
     let rel_source = source_abs.strip_prefix(&manifest_dir).map_err(|_| "source file is outside the package directory".to_string())?.to_string_lossy().to_string();
-
 
     // ---- canonical arguments, extern inputs
     let mut sc_deps = StatCache::open(cache, &format!("deps:{}", out_dir.display()));
@@ -433,13 +405,25 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
         }
     }
     sc_deps.save();
+    // Location-independent outputs: registry sources are remapped to a fixed virtual prefix, so the
+    // same crate compiled under different CARGO_HOME paths yields identical artifacts (otherwise the
+    // embedded source path changes the .rmeta, and every dependent's key with it).
+    let mut real_extra_args = vec![];
+    let mut remap_target = None;
+    let remap_mode = std::env::var("CARGO_RBE_REMAP").unwrap_or_else(|_| "registry".into());
+    if remap_mode == "registry" {
+        if let Some(reg) = &registry_root {
+            real_extra_args.push(format!("--remap-path-prefix={}={}", reg.display(), "/cargo-registry"));
+            canon.push("--remap-path-prefix=$REGISTRY=/cargo-registry".into());
+            remap_target = Some((reg.clone(), "/cargo-registry".to_string()));
+        }
+    }
     for a in &canon {
         let value = a.split_once('=').map(|(_, v)| v).unwrap_or(a.as_str());
         if value.starts_with('/') || tokens.iter().any(|(r, _)| a.contains(r.as_str())) {
             return Err(format!("unmapped absolute path in argument: {a}"));
         }
     }
-
 
     // ---- dependency closure (what rustc may load from the search path)
     let mut closure: BTreeMap<String, re::Digest> = BTreeMap::new();
@@ -467,7 +451,6 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
             None => return Err(format!("dependency closure unknown for {fname} (it was not built through the wrapper in this cache directory)")),
         }
     }
-
 
     // ---- input tree: pkg/, deps/, gen/out/
     let mut excludes: Vec<PathBuf> = vec![];
@@ -505,7 +488,6 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     root.directories.push(re::DirectoryNode { name: "pkg".into(), digest: Some(pkg_digest.clone()) });
     let root_digest = digest_of(&root.encode_to_vec());
 
-
     // ---- environment (allowlist)
     let rustc_id = rustc_identity(rustc)?;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -525,7 +507,6 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     env.insert("CARGO_RBE_INCREMENTAL".into(), if incremental { "1" } else { "0" }.into());
     env.insert("CARGO_RBE_TOOLCHAIN".into(), rustc_id.clone());
 
-
     // ---- outputs
     let stem = crate_name.replace('-', "_");
     let mut outputs = vec![];
@@ -539,7 +520,6 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     }
     outputs.sort_by(|a, b| a.name.cmp(&b.name));
     outputs.dedup_by(|a, b| a.name == b.name);
-
 
     // ---- command and action
     let platform = re::Platform { properties: settings.exec_properties.iter().map(|(k, v)| re::platform::Property { name: k.clone(), value: v.clone() }).collect() };
@@ -575,13 +555,11 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
         "args": command.arguments,
     });
     let blobs = vec![(action.command_digest.clone().unwrap(), cmd_bytes), (action_digest.clone(), action_bytes)];
-    Ok(Plan { action_digest, blobs, outputs, tokens, manifest_dir, out_dir, gen_dir, excludes, closure, allowed_env: allowed, components, cwd: cwd.to_path_buf(), cache_dir: cache.to_path_buf() })
+    Ok(Plan { action_digest, blobs, outputs, tokens, manifest_dir, out_dir, gen_dir, excludes, closure, allowed_env: allowed, components, cwd: cwd.to_path_buf(), cache_dir: cache.to_path_buf(), real_extra_args, remap_target })
 }
-
 
 // ---------------------------------------------------------------------------------------------
 // dep-info verification
-
 
 fn split_make_tokens(line: &str) -> Vec<String> {
     let mut out = vec![];
@@ -607,7 +585,6 @@ fn split_make_tokens(line: &str) -> Vec<String> {
     out
 }
 
-
 /// Every input rustc reports must be inside what we hashed, and every environment variable it
 /// reads must be part of the key. Otherwise the result must not be published.
 fn check_depinfo(text: &str, plan: &Plan) -> R<()> {
@@ -630,7 +607,12 @@ fn check_depinfo(text: &str, plan: &Plan) -> R<()> {
             if tok.is_empty() {
                 continue;
             }
-            let p = absolutize(&plan.cwd, tok);
+            let mut p = absolutize(&plan.cwd, tok);
+            if let Some((real, virt)) = &plan.remap_target {
+                if let Ok(rest) = p.strip_prefix(virt) {
+                    p = real.join(rest);
+                }
+            }
             let in_pkg = p.starts_with(&plan.manifest_dir) && !plan.excludes.iter().any(|e| p.starts_with(e));
             let in_gen = plan.gen_dir.as_ref().map(|g| p.starts_with(g)).unwrap_or(false);
             if !(p.starts_with(&plan.out_dir) || in_pkg || in_gen) {
@@ -641,17 +623,14 @@ fn check_depinfo(text: &str, plan: &Plan) -> R<()> {
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // local execution
-
 
 fn passthrough(rustc: &Path, args: &[OsString]) -> i32 {
     let err = Command::new(rustc).args(args).exec();
     eprintln!("cargo-rbe-wrap: failed to run {}: {err}", rustc.display());
     127
 }
-
 
 /// Run the real rustc, forwarding stderr immediately (Cargo reads it as a stream) while keeping a copy.
 fn run_local(rustc: &Path, args: &[String]) -> (i32, Vec<u8>) {
@@ -682,17 +661,14 @@ fn run_local(rustc: &Path, args: &[String]) -> (i32, Vec<u8>) {
     (code, captured)
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // remote
-
 
 async fn connect(settings: &Settings, invocation_id: &str) -> Result<(Conn, String)> {
     let url = settings.remote_cache.clone().or_else(|| settings.remote_executor.clone()).ok_or_else(|| anyhow!("no remote_cache configured"))?;
     let conn = tokio::time::timeout(Duration::from_secs(8), rpc::connect_with(&url, settings, invocation_id, "rustc")).await.map_err(|_| anyhow!("connect timed out"))??;
     Ok((conn, settings.remote_instance_name.clone().unwrap_or_default()))
 }
-
 
 async fn lookup(conn: &Conn, instance: &str, plan: &Plan) -> Result<Option<re::ActionResult>> {
     let r = conn
@@ -713,13 +689,11 @@ async fn lookup(conn: &Conn, instance: &str, plan: &Plan) -> Result<Option<re::A
     }
 }
 
-
 struct Restored {
     files: usize,
     bytes: u64,
     stderr: Vec<u8>,
 }
-
 
 async fn restore(conn: &Conn, instance: &str, plan: &Plan, ar: &re::ActionResult) -> Result<Restored> {
     let mut want: BTreeMap<String, &re::OutputFile> = BTreeMap::new();
@@ -756,7 +730,6 @@ async fn restore(conn: &Conn, instance: &str, plan: &Plan, ar: &re::ActionResult
     let stderr = untokenize_text(&String::from_utf8_lossy(&raw), &plan.tokens).into_bytes();
     Ok(Restored { files, bytes, stderr })
 }
-
 
 async fn publish(conn: &Conn, instance: &str, plan: &Plan, stderr: &[u8]) -> Result<(String, u64)> {
     let mut blobs = plan.blobs.clone();
@@ -795,15 +768,12 @@ async fn publish(conn: &Conn, instance: &str, plan: &Plan, stderr: &[u8]) -> Res
     Ok(("ok".into(), up))
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // log, settings, entry point
-
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
-
 
 fn write_log(cache: &Path, rec: &Value) {
     let path = std::env::var_os("CARGO_RBE_LOG").map(PathBuf::from).unwrap_or_else(|| cache.join("actions.jsonl"));
@@ -817,7 +787,6 @@ fn write_log(cache: &Path, rec: &Value) {
     }
 }
 
-
 fn load_settings() -> Settings {
     if let Ok(j) = std::env::var("CARGO_RBE_WRAP_SETTINGS") {
         if let Ok(s) = serde_json::from_str::<Settings>(&j) {
@@ -829,17 +798,14 @@ fn load_settings() -> Settings {
     config::load(&names, file.as_deref(), Settings::default()).map(|l| l.settings).unwrap_or_default()
 }
 
-
 fn net_down(cache: &Path) -> bool {
     std::fs::read_to_string(cache.join("remote-down")).ok().and_then(|s| s.trim().parse::<u128>().ok()).map(|t| now_ms().saturating_sub(t) < 30_000).unwrap_or(false)
 }
-
 
 fn mark_down(cache: &Path) {
     let _ = std::fs::create_dir_all(cache);
     let _ = std::fs::write(cache.join("remote-down"), now_ms().to_string());
 }
-
 
 fn record_closure_for_outputs(plan: &Plan) {
     for spec in plan.outputs.iter().filter(|o| o.is_artifact) {
@@ -848,7 +814,6 @@ fn record_closure_for_outputs(plan: &Plan) {
         }
     }
 }
-
 
 pub fn run() -> i32 {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -880,7 +845,6 @@ pub fn run() -> i32 {
         write_log(&cache, &rec);
     };
 
-
     let plan = match make_plan(&rustc, &rest, &cwd, &cache, &settings) {
         Ok(p) => p,
         Err(reason) => {
@@ -895,7 +859,6 @@ pub fn run() -> i32 {
     rec["action_full"] = json!(plan.action_digest.hash);
     rec["key"] = plan.components.clone();
     let mut notes: Vec<String> = vec![];
-
 
     let remote_url = settings.remote_cache.clone().or_else(|| settings.remote_executor.clone());
     let want_net = matches!(mode, Mode::ReadOnly | Mode::Cache) && remote_url.is_some() && !net_down(&cache);
@@ -937,9 +900,10 @@ pub fn run() -> i32 {
         }
     }
 
-
     // miss (or no remote): run rustc locally
-    let (code, stderr) = run_local(&rustc, &rest);
+    let mut real_args = rest.clone();
+    real_args.extend(plan.real_extra_args.iter().cloned());
+    let (code, stderr) = run_local(&rustc, &real_args);
     if code != 0 {
         rec["notes"] = json!(notes);
         finish(rec, "local_failed", t0);
@@ -975,11 +939,9 @@ pub fn run() -> i32 {
     0
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn root_replacement_respects_path_boundaries() {
@@ -989,7 +951,6 @@ mod tests {
         assert_eq!(tokenize_text("x/home/a/ws/y", &toks), "x/home/a/ws/y");
         assert_eq!(untokenize_text("@CWD@/src/lib.rs", &toks), "/home/a/ws/src/lib.rs");
     }
-
 
     #[test]
     fn tokenizes_cargo_style_arguments() {
@@ -1008,19 +969,16 @@ mod tests {
         assert_eq!(extra_filename(&a).as_deref(), Some("-abc"));
     }
 
-
     #[test]
     fn make_style_dep_lines_split_on_unescaped_spaces() {
         assert_eq!(split_make_tokens(r"/o/lib.rmeta: src/lib.rs my\ file.rs"), vec!["/o/lib.rmeta:", "src/lib.rs", "my file.rs"]);
     }
-
 
     #[test]
     fn mode_parsing() {
         assert_eq!(Mode::parse("digest-only"), Some(Mode::DigestOnly));
         assert_eq!(Mode::parse("nope"), None);
     }
-
 
     #[test]
     fn lexical_normalization() {

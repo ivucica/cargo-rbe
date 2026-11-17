@@ -1,17 +1,7 @@
-mod bes;
-mod config;
-#[allow(clippy::all, dead_code, non_camel_case_types, unused_qualifications)]
-mod proto;
-mod rpc;
-mod smoke;
-mod statcache;
-#[allow(dead_code)]
-mod wrap;
-
 use anyhow::{anyhow, Result};
+use cargo_rbe::config::Settings;
+use cargo_rbe::{bes, config, rpc, smoke};
 use clap::{Args, Parser, Subcommand};
-use config::Settings;
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -64,21 +54,24 @@ enum Cmd {
     Smoke(SmokeArgs),
     /// Print the effective configuration (header values are never printed).
     PrintConfig,
-    /// Run cargo with RUSTC_WRAPPER pointed at this binary (D2 cache-only wrapper).
+    /// Run `cargo <args>` with the rustc wrapper set up: `cargo-rbe --config=remote cargo build`.
     Cargo(CargoArgs),
 }
 
 #[derive(Args)]
 struct CargoArgs {
-    /// Wrapper mode: off | digest-only | read-only | cache.
+    /// off | digest-only | read-only | cache
     #[arg(long, default_value = "cache")]
     mode: String,
-    /// Cache directory (default: $XDG_CACHE_HOME/cargo-rbe).
+    /// Path remapping for location-independent artifacts: registry | none
+    #[arg(long, default_value = "registry")]
+    remap: String,
+    /// Where to write the JSONL action log (default: a per-invocation file in the cache directory).
     #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    /// Arguments passed through to cargo (e.g. `build --release`).
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<OsString>,
+    log: Option<PathBuf>,
+    /// Arguments passed to cargo, e.g. `build --release`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    args: Vec<String>,
 }
 
 #[derive(Args)]
@@ -123,17 +116,9 @@ fn cli_settings(c: &Cli) -> Result<Settings> {
     })
 }
 
-fn main() {
-    // RUSTC_WRAPPER mode: cargo invokes this binary as `<exe> <rustc-path> [rustc args...]`.
-    // wrap::run() builds its own runtime when it needs the network, so dispatch before ours.
-    if let Some(first) = std::env::args_os().nth(1) {
-        let first = first.to_string_lossy();
-        if !first.starts_with('-') && !matches!(first.as_ref(), "smoke" | "print-config" | "cargo" | "help") {
-            std::process::exit(wrap::run());
-        }
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("building the tokio runtime");
-    if let Err(e) = rt.block_on(real_main()) {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = real_main().await {
         eprintln!("error: {e:#}");
         std::process::exit(2);
     }
@@ -161,6 +146,7 @@ async fn real_main() -> Result<()> {
             println!("build_metadata: {:?}", s.build_metadata);
             Ok(())
         }
+        Cmd::Cargo(a) => run_cargo(s, a).await,
         Cmd::Smoke(a) => {
             let invocation_id = uuid::Uuid::new_v4().to_string();
             let nonce = a.nonce.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -194,6 +180,7 @@ async fn real_main() -> Result<()> {
                                     invocation_id: invocation_id.clone(),
                                     command_line: bes::redact_args(&std::env::args().collect::<Vec<_>>()),
                                     command: "smoke".into(),
+                                    tool_tag: "cargo-rbe".into(),
                                     build_metadata: s.build_metadata.clone(),
                                     workspace_status: bes::ci_workspace_status(),
                                 },
@@ -248,24 +235,111 @@ async fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Cargo(a) => {
-            let mut cmd = std::process::Command::new("cargo");
-            cmd.args(&a.args);
-            cmd.env("RUSTC_WRAPPER", std::env::current_exe()?);
-            cmd.env("CARGO_RBE_MODE", &a.mode);
-            if let Some(d) = &a.cache_dir {
-                cmd.env("CARGO_RBE_CACHE_DIR", d);
-            }
-            cmd.env("CARGO_RBE_INVOCATION_ID", uuid::Uuid::new_v4().to_string());
-            if let Some(id) = wrap::rustc_identity_for_launcher() {
-                cmd.env("CARGO_RBE_RUSTC_ID", id);
-            }
-            cmd.env("CARGO_RBE_WRAP_SETTINGS", serde_json::to_string(&s)?);
-            let status = cmd.status()?;
-            if !status.success() {
-                return Err(anyhow!("cargo exited with {}", status.code().unwrap_or(-1)));
-            }
-            Ok(())
+    }
+}
+
+fn summarize_log(path: &std::path::Path) -> (Vec<String>, bool) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut reasons: std::collections::BTreeMap<String, u64> = Default::default();
+    let (mut down, mut up) = (0u64, 0u64);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        *counts.entry(v["outcome"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+        down += v["bytes_down"].as_u64().unwrap_or(0);
+        up += v["bytes_up"].as_u64().unwrap_or(0);
+        if let Some(r) = v["reason"].as_str() {
+            *reasons.entry(r.chars().take(110).collect()).or_default() += 1;
+        }
+        if let Some(r) = v["publish"].as_str().filter(|p| *p != "ok") {
+            *reasons.entry(format!("publish: {}", r.chars().take(100).collect::<String>())).or_default() += 1;
         }
     }
+    let total: u64 = counts.values().sum();
+    let mut lines = vec![format!("cargo-rbe: {total} rustc invocations logged ({})", path.display())];
+    for (k, n) in &counts {
+        lines.push(format!("  {k:<22} {n}"));
+    }
+    lines.push(format!("  restored from cache: {down} bytes, uploaded: {up} bytes"));
+    let mut rs: Vec<_> = reasons.into_iter().collect();
+    rs.sort_by(|a, b| b.1.cmp(&a.1));
+    for (r, n) in rs.into_iter().take(6) {
+        lines.push(format!("  {n:>4} x {r}"));
+    }
+    (lines, total > 0)
+}
+
+async fn run_cargo(s: Settings, a: CargoArgs) -> Result<()> {
+    let mode = cargo_rbe::wrap::Mode::parse(&a.mode).ok_or_else(|| anyhow!("--mode must be off, digest-only, read-only or cache"))?;
+    let invocation_id = uuid::Uuid::new_v4().to_string();
+    let wrapper = std::env::current_exe()?.with_file_name("cargo-rbe-wrap");
+    if !wrapper.exists() {
+        return Err(anyhow!("{} not found; build both binaries (cargo build --release)", wrapper.display()));
+    }
+    let cache = cargo_rbe::wrap::cache_dir();
+    let log = a.log.clone().unwrap_or_else(|| cache.join(format!("actions-{invocation_id}.jsonl")));
+    if let Some(d) = log.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let _ = std::fs::remove_file(&log);
+    eprintln!("cargo-rbe: mode {} | invocation {invocation_id}", a.mode);
+    if let Some(t) = &s.results_url {
+        eprintln!("cargo-rbe: results {}", t.replace("{invocation_id}", &invocation_id));
+    }
+
+    let mut bes = None;
+    if let Some(url) = &s.bes_backend {
+        let mut bs = s.clone();
+        bs.remote_header.extend(s.bes_header.clone());
+        match rpc::connect_with(url, &bs, &invocation_id, "cargo").await {
+            Ok(conn) => {
+                let argv = bes::redact_args(&std::env::args().collect::<Vec<_>>());
+                bes = Some(
+                    bes::Bes::start(
+                        conn,
+                        bes::BesConfig {
+                            invocation_id: invocation_id.clone(),
+                            command_line: argv,
+                            command: a.args.first().cloned().unwrap_or_else(|| "build".into()),
+                            tool_tag: "cargo-rbe".into(),
+                            build_metadata: s.build_metadata.clone(),
+                            workspace_status: bes::ci_workspace_status(),
+                        },
+                    )
+                    .await?,
+                );
+            }
+            Err(e) => eprintln!("cargo-rbe: warning: BES backend not reachable, continuing without build events: {e:#}"),
+        }
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.args(&a.args)
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("CARGO_RBE_MODE", &a.mode)
+        .env("CARGO_RBE_REMAP", &a.remap)
+        .env("CARGO_RBE_LOG", &log)
+        .env("CARGO_RBE_INVOCATION_ID", &invocation_id)
+        .env("CARGO_RBE_WRAP_SETTINGS", serde_json::to_string(&s)?);
+    if let Some(id) = cargo_rbe::wrap::rustc_identity_for_launcher() {
+        cmd.env("CARGO_RBE_RUSTC_ID", id);
+    }
+    let status = if mode == cargo_rbe::wrap::Mode::Off { cmd.env_remove("RUSTC_WRAPPER").status() } else { cmd.status() }?;
+    let code = status.code().unwrap_or(1);
+
+    let (lines, _) = summarize_log(&log);
+    for l in &lines {
+        eprintln!("{l}");
+    }
+    if let Some(mut b) = bes {
+        for l in &lines {
+            b.progress(l).await;
+        }
+        let mut log_bytes = std::fs::read(&log).unwrap_or_default();
+        log_bytes.truncate(1024 * 1024);
+        let sum = b.finish(code == 0, &log_bytes).await;
+        eprintln!("cargo-rbe: build events: {} sent, {} acknowledged{}", sum.events_sent, sum.events_acked, if sum.notes.is_empty() { String::new() } else { format!(" ({})", sum.notes.join("; ")) });
+    }
+    std::process::exit(code);
 }

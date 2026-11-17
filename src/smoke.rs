@@ -1,6 +1,7 @@
 //! D1 smoke test: exercises the REAPI surface we depend on, step by step, and reports exactly
 //! what a given server does. Every step is independent where possible so one failure does not
 //! hide the others. Nothing here is specific to a particular service.
+#![allow(deprecated)] // deprecated fields are set on purpose for older servers
 
 use crate::config::{parse_duration, Settings};
 use crate::proto::build::bazel::remote::execution::v2 as re;

@@ -1,71 +1,93 @@
-//! Per-key stat cache for file digests, keyed by (mtime, size). wrap.rs uses it to avoid
-//! re-hashing unchanged files across rustc invocations. One JSON file per key under
-//! `<cache_dir>/stat/`; persistence is best-effort and never fails a build.
+//! Persistent (path, size, mtime, inode) -> SHA-256 cache so unchanged files are hashed once.
+//!
+//! One JSON file per namespace (a package directory, a deps directory, ...), so a wrapper
+//! process only loads the entries it needs. Entries whose mtime is very recent are not stored:
+//! a file rewritten within the timestamp granularity would otherwise keep a stale digest.
 
 use crate::proto::build::bazel::remote::execution::v2 as re;
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Entry {
+    size: u64,
+    mtime_ns: i128,
+    ino: u64,
+    hash: String,
+}
+
+pub struct StatCache {
+    file: PathBuf,
+    map: HashMap<String, Entry>,
+    dirty: bool,
+    now_ns: i128,
+    pub hashed_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
 
 pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-#[derive(Serialize, Deserialize)]
-struct Entry {
-    mtime_nanos: i128,
-    size: u64,
-    hash: String,
-}
-
-pub struct StatCache {
-    path: std::path::PathBuf,
-    entries: BTreeMap<String, Entry>,
-}
-
 impl StatCache {
-    /// Open (or start fresh) the per-key cache file under `<cache_dir>/stat/`.
-    pub fn open(cache_dir: &Path, key: &str) -> Self {
-        let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
-        let path = cache_dir.join("stat").join(format!("{safe}.json"));
-        let entries = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        Self { path, entries }
+    pub fn open(cache_dir: &Path, namespace: &str) -> StatCache {
+        let file = cache_dir.join("stat").join(format!("{}.json", &sha256_hex(namespace.as_bytes())[..24]));
+        let map = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0);
+        StatCache { file, map, dirty: false, now_ns, hashed_bytes: 0, hits: 0, misses: 0 }
     }
 
-    /// Digest of `path`, using the cached hash when mtime and size are unchanged.
-    pub fn file_digest(&mut self, path: &Path) -> Result<re::Digest> {
-        let st = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-        let key = path.to_string_lossy().into_owned();
-        if let Some(e) = self.entries.get(&key) {
-            if e.mtime_nanos == mtime_nanos(&st) && e.size == st.len() {
-                return Ok(re::Digest { hash: e.hash.clone(), size_bytes: e.size as i64 });
+    pub fn file_digest(&mut self, p: &Path) -> std::io::Result<re::Digest> {
+        let md = std::fs::metadata(p)?;
+        let mtime_ns = md.mtime() as i128 * 1_000_000_000 + md.mtime_nsec() as i128;
+        let key = p.to_string_lossy().to_string();
+        if let Some(e) = self.map.get(&key) {
+            if e.size == md.len() && e.mtime_ns == mtime_ns && e.ino == md.ino() {
+                self.hits += 1;
+                return Ok(re::Digest { hash: e.hash.clone(), size_bytes: md.len() as i64 });
             }
         }
-        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let hash = sha256_hex(&data);
-        self.entries.insert(key, Entry { mtime_nanos: mtime_nanos(&st), size: st.len(), hash: hash.clone() });
-        Ok(re::Digest { hash, size_bytes: data.len() as i64 })
+        self.misses += 1;
+        let mut f = std::fs::File::open(p)?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            total += n as u64;
+        }
+        self.hashed_bytes += total;
+        let hash = hex::encode(h.finalize());
+        if self.now_ns - mtime_ns > 2_000_000_000 {
+            self.map.insert(key, Entry { size: total, mtime_ns, ino: md.ino(), hash: hash.clone() });
+            self.dirty = true;
+        }
+        Ok(re::Digest { hash, size_bytes: total as i64 })
     }
 
-    /// Persist the cache. Best-effort: a failure here must not fail a build.
-    pub fn save(&self) {
-        if let Some(dir) = self.path.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
+    pub fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let Some(dir) = self.file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = self.file.with_extension(format!("tmp{}", std::process::id()));
+        if let Ok(b) = serde_json::to_vec(&self.map) {
+            if std::fs::write(&tmp, b).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.file);
             }
         }
-        let tmp = self.path.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, serde_json::to_vec(&self.entries).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
-    }
-}
-
-fn mtime_nanos(st: &std::fs::Metadata) -> i128 {
-    match st.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
-        Some(d) => d.as_secs() as i128 * 1_000_000_000 + d.subsec_nanos() as i128,
-        None => 0,
+        self.dirty = false;
     }
 }

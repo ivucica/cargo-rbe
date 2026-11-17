@@ -68,7 +68,7 @@ pub fn header_names(s: &Settings) -> Vec<String> {
     }
 }
 
-fn build_meta(s: &Settings, invocation_id: &str, action_mnemonic: &str) -> Result<Meta> {
+fn build_meta(s: &Settings, invocation_id: &str, mnemonic: &str) -> Result<Meta> {
     let mut headers = vec![];
     for (n, v) in expand_header_specs(&s.remote_header)? {
         let k = MetadataKey::<Ascii>::from_bytes(n.as_bytes()).map_err(|_| anyhow!("header name '{n}' is not valid for gRPC"))?;
@@ -84,7 +84,7 @@ fn build_meta(s: &Settings, invocation_id: &str, action_mnemonic: &str) -> Resul
         }),
         tool_invocation_id: invocation_id.into(),
         correlated_invocations_id: invocation_id.into(),
-        action_mnemonic: action_mnemonic.into(),
+        action_mnemonic: mnemonic.into(),
         ..Default::default()
     };
     Ok(Meta { headers, reqmeta: MetadataValue::from_bytes(&rm.encode_to_vec()) })
@@ -94,8 +94,7 @@ pub async fn connect(url: &str, s: &Settings, invocation_id: &str) -> Result<Con
     connect_with(url, s, invocation_id, "smoke").await
 }
 
-/// Like [`connect`], but with an explicit action mnemonic for the RequestMetadata (e.g. "rustc" for the wrapper).
-pub async fn connect_with(url: &str, s: &Settings, invocation_id: &str, action_mnemonic: &str) -> Result<Conn> {
+pub async fn connect_with(url: &str, s: &Settings, invocation_id: &str, mnemonic: &str) -> Result<Conn> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("endpoint '{url}' needs a scheme (grpc:// or grpcs://)"))?;
     let (tls, http_scheme) = match scheme {
         "grpcs" | "https" => (true, "https"),
@@ -119,7 +118,7 @@ pub async fn connect_with(url: &str, s: &Settings, invocation_id: &str, action_m
         ep = ep.tls_config(cfg)?;
     }
     let channel = ep.connect().await.with_context(|| format!("connecting to {url}"))?;
-    let svc = InterceptedService::new(channel, build_meta(s, invocation_id, action_mnemonic)?);
+    let svc = InterceptedService::new(channel, build_meta(s, invocation_id, mnemonic)?);
     Ok(Conn { svc, url: url.to_string() })
 }
 
@@ -176,48 +175,6 @@ pub async fn ensure_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec
         }
     }
     Ok(n)
-}
-
-/// Upload every blob that is missing (FindMissingBlobs + BatchUpdateBlobs). Returns (blobs uploaded, bytes uploaded).
-pub async fn upload_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec<u8>)]) -> Result<(usize, u64)> {
-    let mut cas = conn.cas();
-    let missing = cas
-        .find_missing_blobs(re::FindMissingBlobsRequest {
-            instance_name: instance.into(),
-            blob_digests: blobs.iter().map(|(d, _)| d.clone()).collect(),
-            digest_function: 0,
-        })
-        .await
-        .context("FindMissingBlobs")?
-        .into_inner()
-        .missing_blob_digests;
-    if missing.is_empty() {
-        return Ok((0, 0));
-    }
-    let bytes: u64 = blobs.iter().filter(|(d, _)| missing.iter().any(|m| m.hash == d.hash)).map(|(_, data)| data.len() as u64).sum();
-    let reqs: Vec<_> = blobs
-        .iter()
-        .filter(|(d, _)| missing.iter().any(|m| m.hash == d.hash))
-        .map(|(d, data)| re::batch_update_blobs_request::Request {
-            digest: Some(d.clone()),
-            data: data.clone(),
-            compressor: 0,
-        })
-        .collect();
-    let n = reqs.len();
-    let resp = cas
-        .batch_update_blobs(re::BatchUpdateBlobsRequest { instance_name: instance.into(), requests: reqs, digest_function: 0 })
-        .await
-        .context("BatchUpdateBlobs")?
-        .into_inner();
-    for r in resp.responses {
-        if let Some(st) = r.status {
-            if st.code != 0 {
-                bail!("BatchUpdateBlobs: blob {} rejected: code {} {}", r.digest.map(|d| fmt_digest(&d)).unwrap_or_default(), st.code, st.message);
-            }
-        }
-    }
-    Ok((n, bytes))
 }
 
 pub async fn batch_read(conn: &Conn, instance: &str, d: &re::Digest) -> Result<Vec<u8>> {
@@ -289,4 +246,68 @@ pub async fn fetch(conn: &Conn, instance: &str, d: &re::Digest) -> Result<Vec<u8
         bail!("fetched blob {} failed hash verification", fmt_digest(d));
     }
     Ok(data)
+}
+
+/// Upload blobs: FindMissingBlobs first, then BatchUpdateBlobs for small ones (grouped under the
+/// batch limit) and ByteStream for large ones. Returns (blobs uploaded, bytes uploaded).
+pub async fn upload_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec<u8>)]) -> Result<(usize, u64)> {
+    const SMALL: usize = 1024 * 1024;
+    const BATCH_LIMIT: usize = 3_500_000;
+    let mut uniq: Vec<&(re::Digest, Vec<u8>)> = vec![];
+    for b in blobs {
+        if !uniq.iter().any(|u| u.0.hash == b.0.hash) {
+            uniq.push(b);
+        }
+    }
+    let missing = conn
+        .cas()
+        .find_missing_blobs(re::FindMissingBlobsRequest {
+            instance_name: instance.into(),
+            blob_digests: uniq.iter().map(|b| b.0.clone()).collect(),
+            digest_function: 0,
+        })
+        .await
+        .context("FindMissingBlobs")?
+        .into_inner()
+        .missing_blob_digests;
+    let todo: Vec<&&(re::Digest, Vec<u8>)> = uniq.iter().filter(|b| missing.iter().any(|m| m.hash == b.0.hash)).collect();
+    let (mut n, mut bytes) = (0usize, 0u64);
+    let mut batch: Vec<re::batch_update_blobs_request::Request> = vec![];
+    let mut batch_bytes = 0usize;
+    async fn flush(conn: &Conn, instance: &str, batch: &mut Vec<re::batch_update_blobs_request::Request>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let resp = conn
+            .cas()
+            .batch_update_blobs(re::BatchUpdateBlobsRequest { instance_name: instance.into(), requests: std::mem::take(batch), digest_function: 0 })
+            .await
+            .context("BatchUpdateBlobs")?
+            .into_inner();
+        for r in resp.responses {
+            if let Some(st) = r.status {
+                if st.code != 0 {
+                    bail!("BatchUpdateBlobs: code {} {}", st.code, st.message);
+                }
+            }
+        }
+        Ok(())
+    }
+    for b in todo {
+        let (d, data) = (&b.0, &b.1);
+        if data.len() > SMALL {
+            bs_write(conn, instance, data).await?;
+        } else {
+            if batch_bytes + data.len() > BATCH_LIMIT {
+                flush(conn, instance, &mut batch).await?;
+                batch_bytes = 0;
+            }
+            batch.push(re::batch_update_blobs_request::Request { digest: Some(d.clone()), data: data.clone(), compressor: 0 });
+            batch_bytes += data.len();
+        }
+        n += 1;
+        bytes += data.len() as u64;
+    }
+    flush(conn, instance, &mut batch).await?;
+    Ok((n, bytes))
 }

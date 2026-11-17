@@ -10,6 +10,7 @@
 //! Event order follows Bazel's: BuildEnqueued and InvocationAttemptStarted (lifecycle, controller
 //! stream), then the tool stream, then InvocationAttemptFinished and BuildFinished (lifecycle).
 //! Every build event declares the children that will follow, and the last one sets last_message.
+#![allow(deprecated)] // deprecated fields are set on purpose for older servers
 
 use crate::proto::build_event_stream as bep;
 use crate::proto::command_line as cl;
@@ -43,6 +44,9 @@ fn unstructured_id() -> bep::BuildEventId {
 fn structured_id(label: &str) -> bep::BuildEventId {
     id(bep::build_event_id::Id::StructuredCommandLine(bep::build_event_id::StructuredCommandLineId { command_line_label: label.into() }))
 }
+fn options_parsed_id() -> bep::BuildEventId {
+    id(bep::build_event_id::Id::OptionsParsed(bep::build_event_id::OptionsParsedId {}))
+}
 fn workspace_status_id() -> bep::BuildEventId {
     id(bep::build_event_id::Id::WorkspaceStatus(bep::build_event_id::WorkspaceStatusId {}))
 }
@@ -65,6 +69,8 @@ pub struct BesConfig {
     /// Already redacted (no header values).
     pub command_line: Vec<String>,
     pub command: String,
+    /// Shown by servers as the "tool tag" (the only tool identity the event stream carries).
+    pub tool_tag: String,
     pub build_metadata: BTreeMap<String, String>,
     pub workspace_status: BTreeMap<String, String>,
 }
@@ -200,7 +206,7 @@ impl Bes {
 
         let started = bep::BuildEvent {
             id: Some(started_id()),
-            children: vec![progress_id(0), unstructured_id(), structured_id("original"), workspace_status_id(), metadata_id(), finished_id()],
+            children: vec![progress_id(0), unstructured_id(), structured_id("original"), options_parsed_id(), workspace_status_id(), metadata_id(), finished_id()],
             last_message: false,
             payload: Some(bep::build_event::Payload::Started(bep::BuildStarted {
                 uuid: cfg.invocation_id.clone(),
@@ -226,24 +232,54 @@ impl Bes {
         })
         .await;
 
-        // Structured command line: executable, command, residual (all already redacted).
-        let chunk = |s: Vec<String>| cl::CommandLineSection {
-            section_label: String::new(),
+        // Structured command line and parsed options. Splitting the (already redacted) arguments
+        // into executable / command / options / residual is what lets servers show the invocation
+        // like a Bazel one; the options also drive badges such as "remote execution on".
+        let parsed = split_command_line(&cfg.command_line, &cfg.command);
+        let chunk = |label: &str, s: Vec<String>| cl::CommandLineSection {
+            section_label: label.into(),
             section_type: Some(cl::command_line_section::SectionType::ChunkList(cl::ChunkList { chunk: s })),
         };
-        let mut exe = chunk(cfg.command_line.iter().take(1).cloned().collect());
-        exe.section_label = "executable".into();
-        let mut cmd = chunk(vec![cfg.command.clone()]);
-        cmd.section_label = "command".into();
-        let mut residual = chunk(cfg.command_line.iter().skip(1).cloned().collect());
-        residual.section_label = "residual".into();
+        let mut sections = vec![chunk("executable", parsed.executable.clone()), chunk("command", vec![cfg.command.clone()])];
+        sections.push(cl::CommandLineSection {
+            section_label: "command options".into(),
+            section_type: Some(cl::command_line_section::SectionType::OptionList(cl::OptionList {
+                option: parsed
+                    .options
+                    .iter()
+                    .map(|(name, value)| cl::Option {
+                        combined_form: if value.is_empty() { format!("--{name}") } else { format!("--{name}={value}") },
+                        option_name: name.clone(),
+                        option_value: value.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            })),
+        });
+        if !parsed.residual.is_empty() {
+            sections.push(chunk("residual", parsed.residual.clone()));
+        }
         bes.send(bep::BuildEvent {
             id: Some(structured_id("original")),
             children: vec![],
             last_message: false,
-            payload: Some(bep::build_event::Payload::StructuredCommandLine(cl::CommandLine {
-                command_line_label: "original".into(),
-                sections: vec![exe, cmd, residual],
+            payload: Some(bep::build_event::Payload::StructuredCommandLine(cl::CommandLine { command_line_label: "original".into(), sections })),
+        })
+        .await;
+        let combined: Vec<String> = parsed
+            .options
+            .iter()
+            .map(|(n, v)| if v.is_empty() { format!("--{n}") } else { format!("--{n}={v}") })
+            .collect();
+        bes.send(bep::BuildEvent {
+            id: Some(options_parsed_id()),
+            children: vec![],
+            last_message: false,
+            payload: Some(bep::build_event::Payload::OptionsParsed(bep::OptionsParsed {
+                cmd_line: combined.clone(),
+                explicit_cmd_line: combined,
+                tool_tag: cfg.tool_tag.clone(),
+                ..Default::default()
             })),
         })
         .await;
@@ -388,6 +424,44 @@ impl Bes {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct ParsedCommandLine {
+    pub executable: Vec<String>,
+    pub options: Vec<(String, String)>,
+    pub residual: Vec<String>,
+}
+
+/// Split `[exe, args...]` into executable, `--name[=value]` options and residual arguments,
+/// dropping the first occurrence of `command` (it is reported separately). A bare `--name`
+/// followed by a non-flag argument is treated as `--name value` (all our flags take values).
+pub fn split_command_line(args: &[String], command: &str) -> ParsedCommandLine {
+    let mut out = ParsedCommandLine { executable: args.iter().take(1).cloned().collect(), options: vec![], residual: vec![] };
+    let mut command_seen = false;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(rest) = a.strip_prefix("--") {
+            match rest.split_once('=') {
+                Some((n, v)) => out.options.push((n.to_string(), v.to_string())),
+                None => {
+                    if i + 1 < args.len() && !args[i + 1].starts_with("--") && args[i + 1] != command {
+                        out.options.push((rest.to_string(), args[i + 1].clone()));
+                        i += 1;
+                    } else {
+                        out.options.push((rest.to_string(), String::new()));
+                    }
+                }
+            }
+        } else if !command_seen && a == command {
+            command_seen = true;
+        } else {
+            out.residual.push(a.clone());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Redact secrets from a command line before it is published: literal header values are
 /// replaced; `@env:`/`@file:` references are kept (they are not secret).
 pub fn redact_args(args: &[String]) -> Vec<String> {
@@ -467,6 +541,14 @@ mod tests {
     #[test]
     fn header_flag_without_equals_is_fully_redacted() {
         assert_eq!(redact_args(&v(&["--remote_header=tokenwithoutname"])), v(&["--remote_header=<redacted>"]));
+    }
+
+    #[test]
+    fn splits_command_line_without_duplicating_the_command() {
+        let p = split_command_line(&v(&["cargo-rbe", "--remote_executor=grpc://x", "smoke", "--json-out", "r.json", "extra"]), "smoke");
+        assert_eq!(p.executable, v(&["cargo-rbe"]));
+        assert_eq!(p.options, vec![("remote_executor".to_string(), "grpc://x".to_string()), ("json-out".to_string(), "r.json".to_string())]);
+        assert_eq!(p.residual, v(&["extra"]));
     }
 
     #[test]
