@@ -5,12 +5,12 @@
 //! Nothing here is specific to any one REAPI service.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Settings {
     pub remote_executor: Option<String>,
     pub remote_cache: Option<String>,

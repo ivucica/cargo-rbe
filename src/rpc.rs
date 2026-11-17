@@ -68,7 +68,7 @@ pub fn header_names(s: &Settings) -> Vec<String> {
     }
 }
 
-fn build_meta(s: &Settings, invocation_id: &str) -> Result<Meta> {
+fn build_meta(s: &Settings, invocation_id: &str, action_mnemonic: &str) -> Result<Meta> {
     let mut headers = vec![];
     for (n, v) in expand_header_specs(&s.remote_header)? {
         let k = MetadataKey::<Ascii>::from_bytes(n.as_bytes()).map_err(|_| anyhow!("header name '{n}' is not valid for gRPC"))?;
@@ -84,13 +84,18 @@ fn build_meta(s: &Settings, invocation_id: &str) -> Result<Meta> {
         }),
         tool_invocation_id: invocation_id.into(),
         correlated_invocations_id: invocation_id.into(),
-        action_mnemonic: "smoke".into(),
+        action_mnemonic: action_mnemonic.into(),
         ..Default::default()
     };
     Ok(Meta { headers, reqmeta: MetadataValue::from_bytes(&rm.encode_to_vec()) })
 }
 
 pub async fn connect(url: &str, s: &Settings, invocation_id: &str) -> Result<Conn> {
+    connect_with(url, s, invocation_id, "smoke").await
+}
+
+/// Like [`connect`], but with an explicit action mnemonic for the RequestMetadata (e.g. "rustc" for the wrapper).
+pub async fn connect_with(url: &str, s: &Settings, invocation_id: &str, action_mnemonic: &str) -> Result<Conn> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("endpoint '{url}' needs a scheme (grpc:// or grpcs://)"))?;
     let (tls, http_scheme) = match scheme {
         "grpcs" | "https" => (true, "https"),
@@ -114,7 +119,7 @@ pub async fn connect(url: &str, s: &Settings, invocation_id: &str) -> Result<Con
         ep = ep.tls_config(cfg)?;
     }
     let channel = ep.connect().await.with_context(|| format!("connecting to {url}"))?;
-    let svc = InterceptedService::new(channel, build_meta(s, invocation_id)?);
+    let svc = InterceptedService::new(channel, build_meta(s, invocation_id, action_mnemonic)?);
     Ok(Conn { svc, url: url.to_string() })
 }
 
@@ -171,6 +176,48 @@ pub async fn ensure_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec
         }
     }
     Ok(n)
+}
+
+/// Upload every blob that is missing (FindMissingBlobs + BatchUpdateBlobs). Returns (blobs uploaded, bytes uploaded).
+pub async fn upload_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec<u8>)]) -> Result<(usize, u64)> {
+    let mut cas = conn.cas();
+    let missing = cas
+        .find_missing_blobs(re::FindMissingBlobsRequest {
+            instance_name: instance.into(),
+            blob_digests: blobs.iter().map(|(d, _)| d.clone()).collect(),
+            digest_function: 0,
+        })
+        .await
+        .context("FindMissingBlobs")?
+        .into_inner()
+        .missing_blob_digests;
+    if missing.is_empty() {
+        return Ok((0, 0));
+    }
+    let bytes: u64 = blobs.iter().filter(|(d, _)| missing.iter().any(|m| m.hash == d.hash)).map(|(_, data)| data.len() as u64).sum();
+    let reqs: Vec<_> = blobs
+        .iter()
+        .filter(|(d, _)| missing.iter().any(|m| m.hash == d.hash))
+        .map(|(d, data)| re::batch_update_blobs_request::Request {
+            digest: Some(d.clone()),
+            data: data.clone(),
+            compressor: 0,
+        })
+        .collect();
+    let n = reqs.len();
+    let resp = cas
+        .batch_update_blobs(re::BatchUpdateBlobsRequest { instance_name: instance.into(), requests: reqs, digest_function: 0 })
+        .await
+        .context("BatchUpdateBlobs")?
+        .into_inner();
+    for r in resp.responses {
+        if let Some(st) = r.status {
+            if st.code != 0 {
+                bail!("BatchUpdateBlobs: blob {} rejected: code {} {}", r.digest.map(|d| fmt_digest(&d)).unwrap_or_default(), st.code, st.message);
+            }
+        }
+    }
+    Ok((n, bytes))
 }
 
 pub async fn batch_read(conn: &Conn, instance: &str, d: &re::Digest) -> Result<Vec<u8>> {

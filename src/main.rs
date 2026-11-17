@@ -4,10 +4,14 @@ mod config;
 mod proto;
 mod rpc;
 mod smoke;
+mod statcache;
+#[allow(dead_code)]
+mod wrap;
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use config::Settings;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -60,6 +64,21 @@ enum Cmd {
     Smoke(SmokeArgs),
     /// Print the effective configuration (header values are never printed).
     PrintConfig,
+    /// Run cargo with RUSTC_WRAPPER pointed at this binary (D2 cache-only wrapper).
+    Cargo(CargoArgs),
+}
+
+#[derive(Args)]
+struct CargoArgs {
+    /// Wrapper mode: off | digest-only | read-only | cache.
+    #[arg(long, default_value = "cache")]
+    mode: String,
+    /// Cache directory (default: $XDG_CACHE_HOME/cargo-rbe).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Arguments passed through to cargo (e.g. `build --release`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<OsString>,
 }
 
 #[derive(Args)]
@@ -104,9 +123,17 @@ fn cli_settings(c: &Cli) -> Result<Settings> {
     })
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = real_main().await {
+fn main() {
+    // RUSTC_WRAPPER mode: cargo invokes this binary as `<exe> <rustc-path> [rustc args...]`.
+    // wrap::run() builds its own runtime when it needs the network, so dispatch before ours.
+    if let Some(first) = std::env::args_os().nth(1) {
+        let first = first.to_string_lossy();
+        if !first.starts_with('-') && !matches!(first.as_ref(), "smoke" | "print-config" | "cargo" | "help") {
+            std::process::exit(wrap::run());
+        }
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("building the tokio runtime");
+    if let Err(e) = rt.block_on(real_main()) {
         eprintln!("error: {e:#}");
         std::process::exit(2);
     }
@@ -218,6 +245,25 @@ async fn real_main() -> Result<()> {
             println!("\nsummary: {} ok, {} skipped, {} failed", rep.steps.len() - failed - skipped, skipped, failed);
             if rep.failed() {
                 std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Cargo(a) => {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.args(&a.args);
+            cmd.env("RUSTC_WRAPPER", std::env::current_exe()?);
+            cmd.env("CARGO_RBE_MODE", &a.mode);
+            if let Some(d) = &a.cache_dir {
+                cmd.env("CARGO_RBE_CACHE_DIR", d);
+            }
+            cmd.env("CARGO_RBE_INVOCATION_ID", uuid::Uuid::new_v4().to_string());
+            if let Some(id) = wrap::rustc_identity_for_launcher() {
+                cmd.env("CARGO_RBE_RUSTC_ID", id);
+            }
+            cmd.env("CARGO_RBE_WRAP_SETTINGS", serde_json::to_string(&s)?);
+            let status = cmd.status()?;
+            if !status.success() {
+                return Err(anyhow!("cargo exited with {}", status.code().unwrap_or(-1)));
             }
             Ok(())
         }
