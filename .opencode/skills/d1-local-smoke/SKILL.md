@@ -16,8 +16,8 @@ real executor (the D1.1 local BuildBuddy stack or a cloud run). Expected result:
 - Rust toolchain >= 1.89 (Cargo.lock pins uuid@1.29.2 which requires it; the system
   rustc may be older, e.g. 1.85). Deploy one with the rust-toolchain skill instead of
   modifying the system: `.opencode/skills/rust-toolchain/rust-toolchain.sh deploy`
-  (pinned 1.91.1, sha256-verified; prefix via --prefix / RBE_RUST_PREFIX, default
-  /tmp/opencode/rust-home). Historical note for the 2026-11-15 run: manual route —
+  (pinned 1.91.1, sha256-verified; prefix via --prefix / RBE_RUST_PREFIX, default is
+  the XDG cache basedir + /.rust-toolchain-cache). Historical note for the 2026-11-15 run: manual route —
   dist tarball + `./install.sh --destdir=<scratch>/rust-home` (binaries under
   `<scratch>/rust-home/usr/local/bin`; component-style tarballs have no bare bin/).
 - curl. No redis needed for D1 (that is D1.1).
