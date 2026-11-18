@@ -1,6 +1,7 @@
 .opencode/*
 !.opencode/plans/
 !.opencode/skills/
+!.opencode/agents/
 # design originals, import tarballs and delivery-wrapper zips are archived elsewhere (living doc at repo root; tree unpacked from tarballs)
 .opencode/plans/cargo-rbe-design.v*.md
 .opencode/plans/*.tar.gz
