@@ -294,7 +294,7 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 **D2. Cache-only wrapper** (done): `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. Includes the two-checkout acceptance test and the JSONL action log.
 
-**D3. Remote execution of one real rustc unit** (a registry dependency such as `cfg-if`), with eager downloads. Proposal: reuse the D2 Action, upload the input tree (package, dependency closure, `OUT_DIR`) and run it on a worker whose image provides the same rustc, then compare the remote outputs with a local build of the same unit.
+**D3 (proposal, after the real-project results).** Build-script execution first: run `build_script_build` as an Action (inputs: the compiled script, the package tree, the filtered environment, the toolchain it probes; outputs: `OUT_DIR` and the parsed directives), through a shim at the path Cargo executes, as described in section 7. That removes the dominant cost in builds with native dependencies and makes the `gen` input of every downstream unit remote-produced. Then proc-macro and link units. Remote execution of one plain rustc unit remains a good first smoke for the worker image, but is no longer the first step.
 
 Later chunks follow the rollout in section 13.
 
@@ -389,6 +389,35 @@ Findings while building it, worth recording:
 Differences from the design, on purpose: no daemon yet (each wrapper process connects itself and keeps its state on disk; a circuit breaker skips the network for 30 seconds after a failed connect); input hashing is the whole package directory rather than the precise two-stage lookup; only library units are cached; inputs are not uploaded to the CAS (nothing executes them yet), only the Command, Action and outputs. Remote execution of one real rustc unit (D3) needs the input tree and the toolchain on the worker.
 
 Not verified: any real-world project (large dependency graphs, features, proc-macro heavy code, build scripts that probe the system), BuildBuddy cloud for the wrapper, cache eviction behavior, and parallel builds under heavy `-j` (the wrapper is thread-safe by construction: separate processes, atomic file writes, but untested at scale).
+
+### Field results for D2 and real-project runs (reported 2026-11-17)
+
+Your GitHub Actions runs: smoke 7/7 on BuildBuddy cloud (17 events acknowledged, one more than before because of `OptionsParsed`) and on the local stack; the wrapper acceptance test passed on both the local cache-only server and local BuildBuddy; the external-target variant failed with "nothing was published in A". Cause: both variants ran against one server in one job, so the second found the first run's entries already cached. The test assumed an empty cache. Fixed: the workspace crate now carries a run-unique line, and the check accepts "already cached" for the registry crate while still requiring at least one publish.
+
+Real projects (debug profile, one-CPU sandbox, local cache-only server, build A in one directory then build B in another with a different `CARGO_HOME`):
+
+| | ripgrep 15.2.0 | fd v10.5.2 |
+|---|---|---|
+| rustc invocations | 44 | 71 |
+| cacheable and published by A | 33 | 56 |
+| restored by B | 33 of 33 | 56 of 56 (after the fix below; 54 of 56 before) |
+| not cached | 10 build scripts, the `rg` binary | 12 binaries (11 build scripts, `fd`), 1 proc macro, 2 crates needing native link flags (jemalloc) |
+| uploaded by A / restored by B | 148 MB | 131 MB |
+| wall time A / B | about 55 s / 17 s | about 140 s / 108 s |
+| average cost of a hit | | 134 to 229 ms |
+
+What it showed:
+
+- **A locally built proc macro poisons its dependents.** In fd, `clap` and `clap_complete` missed in B with identical sources and commands; the only difference was `libclap_derive-...so`, built locally in each checkout into different bytes. With serde derive the same thing would hit most of a dependency graph. The cause was that path remapping was applied only to units the wrapper caches; passed-through units, including proc macros, embedded `CARGO_HOME` and the working directory. Remapping every registry-crate compile (registry path and working directory) makes the `.so` byte-identical across checkouts (same digest in both) and fd goes to 56 of 56.
+- **Build-script execution dominates once libraries are cached.** In fd, `tikv-jemalloc-sys`'s build script (compiling jemalloc's C sources) took about 94 s of the roughly 108 s in B; the 56 restored units cost 7 s in total. In ripgrep, build scripts took a few seconds, so the cache pays off immediately. Estimated from file timestamps, one-CPU machine, indicative only.
+- **Restored data is large in the debug profile** (130 to 150 MB for a small project), mostly `.rlib` debuginfo. Transfer volume, not lookup latency, will govern real use; `--release` and `.rmeta`-only dependency edges are the levers.
+
+Two bugs of mine surfaced on the way, both in test tooling, and one led to a hardening:
+
+- The first version of the real-project script took its results directory from an environment variable named `OUT_DIR`, which is also what Cargo uses for build-script output. rustc inherited it, the wrapper hashed that directory as a crate's generated code, and B missed 24 of 33 units. Renamed to `RESULTS_DIR`, and the wrapper now refuses an `OUT_DIR` that is not inside the target directory (the unit is then simply not cached, with the reason logged). The workflow had the same collision and is fixed.
+- A shared `CARGO_TARGET_DIR` and a pre-warmed server each broke the acceptance test earlier; see above.
+
+Where D3 should start, given this: **running build scripts remotely or caching their output** (the biggest remaining cost where native dependencies are built from source, and a prerequisite for remote execution of everything downstream), then **proc-macro and link units** (proc macros are now reproducible, but still compiled locally), then crates with native link flags. Remote execution of a single rustc unit, as proposed before, would show the mechanism but not the largest cost.
 
 ### Invocation IDs and results URLs
 
