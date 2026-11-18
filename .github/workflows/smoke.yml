@@ -23,6 +23,17 @@ on:
       nonce:
         description: "Reuse a nonce to test cache hits across runs (optional)"
         required: false
+      project_repo:
+        description: "Also run the wrapper on a real project against the configured remote: git URL (optional)"
+        required: false
+      project_ref:
+        description: "Tag or branch of that project (default 15.2.0, for ripgrep)"
+        required: false
+        default: "15.2.0"
+      project_cargo_args:
+        description: "cargo arguments for the project run"
+        required: false
+        default: "build"
   pull_request:
     paths: ["src/**", "Cargo.*", ".github/workflows/smoke.yml", "protos/**", "scripts/**", "examples/**"]
 
@@ -237,6 +248,21 @@ jobs:
           [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
           BIN_DIR="$PWD" scripts/two-checkout-test.sh --remote-cache "${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}" "${args[@]}" | tee wrapper-test.log
           { echo "### wrapper acceptance test (configured cache)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Manual runs only: the wrapper on a real project (see scripts/real-project-test.sh).
+      - name: Real project against the configured cache
+        if: github.event_name == 'workflow_dispatch' && inputs.project_repo != ''
+        env:
+          CARGO_ARGS: ${{ inputs.project_cargo_args }}
+          RESULTS_DIR: real-project-out
+        run: |
+          args=(--remote_cache="${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}")
+          args+=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
+          [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
+          BIN_DIR="$PWD" scripts/real-project-test.sh "${{ inputs.project_repo }}" "${{ inputs.project_ref }}" "${args[@]}" | tee real-project.log
+          { echo "### real project: ${{ inputs.project_repo }} @ ${{ inputs.project_ref }}"; echo '```'; cat real-project-out/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.project_repo != ''
+        with: { name: real-project, path: real-project-out }
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: report-remote, path: "report.json\nsmoke.log\nwrapper-test.log" }

@@ -209,6 +209,33 @@ struct Plan {
     remap_target: Option<(PathBuf, String)>,
 }
 
+fn registry_root_of(manifest_dir: &Path) -> Option<PathBuf> {
+    manifest_dir
+        .ancestors()
+        .find(|a| {
+            a.parent().and_then(|p| p.file_name()).map(|n| n == "src").unwrap_or(false)
+                && a.parent().and_then(|p| p.parent()).and_then(|p| p.file_name()).map(|n| n == "registry").unwrap_or(false)
+        })
+        .map(|p| p.to_path_buf())
+}
+
+/// Path remapping applied to every compile of a registry crate (cached or not), so that artifacts
+/// do not embed CARGO_HOME or the working directory. Returns (real flags, canonical flags).
+/// The registry flag comes last: when CARGO_HOME lives inside the working directory the more
+/// specific remapping must win.
+fn registry_remap_flags(manifest_dir: &Path, cwd: &Path) -> (Vec<String>, Vec<String>) {
+    if std::env::var("CARGO_RBE_REMAP").unwrap_or_else(|_| "registry".into()) != "registry" {
+        return (vec![], vec![]);
+    }
+    match registry_root_of(manifest_dir) {
+        Some(reg) => (
+            vec![format!("--remap-path-prefix={}=/workspace", cwd.display()), format!("--remap-path-prefix={}=/cargo-registry", reg.display())],
+            vec!["--remap-path-prefix=$CWD=/workspace".into(), "--remap-path-prefix=$REGISTRY=/cargo-registry".into()],
+        ),
+        None => (vec![], vec![]),
+    }
+}
+
 fn is_cargo_cachedir(p: &Path) -> bool {
     p.join("CACHEDIR.TAG").exists()
 }
@@ -342,10 +369,7 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     for _ in 0..(if has_target { 3 } else { 2 }) {
         target_root.pop();
     }
-    let registry_root = manifest_dir
-        .ancestors()
-        .find(|a| a.parent().and_then(|p| p.file_name()).map(|n| n == "src").unwrap_or(false) && a.parent().and_then(|p| p.parent()).and_then(|p| p.file_name()).map(|n| n == "registry").unwrap_or(false))
-        .map(|p| p.to_path_buf());
+    let registry_root = registry_root_of(&manifest_dir);
     let cargo_home = registry_root.as_ref().and_then(|r| r.parent()?.parent()?.parent().map(|p| p.to_path_buf()));
     let mut tokens: Vec<(String, String)> = vec![];
     let mut add = |p: Option<&PathBuf>, tok: &str| {
@@ -408,16 +432,9 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     // Location-independent outputs: registry sources are remapped to a fixed virtual prefix, so the
     // same crate compiled under different CARGO_HOME paths yields identical artifacts (otherwise the
     // embedded source path changes the .rmeta, and every dependent's key with it).
-    let mut real_extra_args = vec![];
-    let mut remap_target = None;
-    let remap_mode = std::env::var("CARGO_RBE_REMAP").unwrap_or_else(|_| "registry".into());
-    if remap_mode == "registry" {
-        if let Some(reg) = &registry_root {
-            real_extra_args.push(format!("--remap-path-prefix={}={}", reg.display(), "/cargo-registry"));
-            canon.push("--remap-path-prefix=$REGISTRY=/cargo-registry".into());
-            remap_target = Some((reg.clone(), "/cargo-registry".to_string()));
-        }
-    }
+    let (real_extra_args, canon_remap) = registry_remap_flags(&manifest_dir, cwd);
+    let remap_target = registry_root.clone().filter(|_| !real_extra_args.is_empty()).map(|r| (r, "/cargo-registry".to_string()));
+    canon.extend(canon_remap);
     for a in &canon {
         let value = a.split_once('=').map(|(_, v)| v).unwrap_or(a.as_str());
         if value.starts_with('/') || tokens.iter().any(|(r, _)| a.contains(r.as_str())) {
@@ -463,6 +480,13 @@ fn make_plan(rustc: &Path, args: &[String], cwd: &Path, cache: &Path, settings: 
     let mut sc_pkg = StatCache::open(cache, &format!("pkg:{}", manifest_dir.display()));
     let pkg_digest = dir_digest(&mut sc_pkg, &manifest_dir, &excludes, &mut count)?;
     let gen_dir = std::env::var("OUT_DIR").ok().map(|p| absolutize(cwd, &p));
+    if let Some(g) = &gen_dir {
+        // Cargo creates OUT_DIR under the target directory. Anything else is a stray variable (or an
+        // unknown layout) and must not be hashed as if it were generated code.
+        if !g.starts_with(&target_root) {
+            return Err(format!("OUT_DIR {} is outside the target directory", g.display()));
+        }
+    }
     let gen_digest = match &gen_dir {
         Some(g) if g.is_dir() => {
             let mut sc_gen = StatCache::open(cache, &format!("gen:{}", g.display()));
@@ -851,7 +875,15 @@ pub fn run() -> i32 {
             rec["eligible"] = json!(false);
             rec["reason"] = json!(reason);
             finish(rec, "local_only", t0);
-            return passthrough(&rustc, rest_os);
+            // Not cached, but still remapped (registry crates only) so that what it produces, e.g. a
+            // proc macro, is identical across checkouts and does not poison its dependents' keys.
+            let mut args_os: Vec<OsString> = rest_os.to_vec();
+            if let Ok(m) = std::env::var("CARGO_MANIFEST_DIR") {
+                for a in registry_remap_flags(&normalize(Path::new(&m)), &cwd).0 {
+                    args_os.push(a.into());
+                }
+            }
+            return passthrough(&rustc, &args_os);
         }
     };
     rec["eligible"] = json!(true);

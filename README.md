@@ -79,10 +79,12 @@ binaries, tests, proc macros, build scripts (their compile), anything with `-l`/
 and crates whose dependency closure is unknown (built before the wrapper saw them).
 
 **Things worth knowing**
-- Registry sources are remapped with `--remap-path-prefix` (`--remap registry`, default; `none` to
-  disable) so artifacts do not embed `CARGO_HOME`. Without it the `.rmeta` bytes differ per
-  location, and every dependent's key changes with them. Panic and debuginfo paths for registry
-  crates show `/cargo-registry/...` as a result.
+- Every compile of a registry crate, cached or not, gets `--remap-path-prefix` for the registry
+  directory (`/cargo-registry`) and for the working directory (`/workspace`), unless `--remap none`.
+  Without it the artifacts embed `CARGO_HOME` and the working directory: the `.rmeta` differed per
+  location, and a locally built proc macro `.so` did too, which made every dependent miss. Paths of
+  registry crates in panics and debuginfo therefore show `/cargo-registry/...` or `/workspace`. Workspace
+  crates are not remapped.
 - A crate that reads `CARGO_MANIFEST_DIR` through `env!` is never published (its output may embed
   the path), and so never hits. Any other environment variable a crate reads must be in the key,
   otherwise the result is not published. Inputs rustc reports (dep-info) that fall outside what was
@@ -95,6 +97,7 @@ and crates whose dependency closure is unknown (built before the wrapper saw the
 - `CARGO_RBE_WRAP_SETTINGS` (the resolved config, including header *specs*) is placed in Cargo's
   environment, so build scripts and proc macros can read it. Use `@env:`/`@file:` header references
   rather than literal values, as everywhere else.
+- `OUT_DIR` must lie inside the target directory (where Cargo puts it); otherwise the unit is not cached.
 - Unix only. The rustc version is part of the key (`rustc -vV`, computed once per `cargo-rbe cargo` run).
 
 **Log.** One JSON line per compile invocation (`--log`, default
@@ -102,6 +105,23 @@ and crates whose dependency closure is unknown (built before the wrapper saw the
 `local`, `local_only`, ...), the reason when ineligible or not published, the Action digest, and the key
 components (toolchain, command, input root, package, deps, closure) so two digests can be compared.
 With `--bes_backend` the log is attached to the invocation and the summary appears as console output.
+
+**On a real project.** `scripts/real-project-test.sh GIT_URL REF [cargo-rbe flags]` clones the project twice
+into different directories (own `CARGO_HOME`, own empty target dir), builds it through the wrapper in
+each, and prints what was cached, what hit, what could not be cached and why, which units missed in the
+second build and which dependency file differed, and roughly how long the build scripts took. Logs go
+to `$RESULTS_DIR` (default `./real-project-out`) and contain no header values:
+
+```
+scripts/real-project-test.sh https://github.com/BurntSushi/ripgrep.git 15.2.0 \
+  --remote_cache=grpcs://rbe.example.com --remote_header=@env:RBE_HEADERS
+```
+
+In GitHub Actions: Actions, smoke, Run workflow, and fill `project_repo` (and optionally `project_ref`,
+`project_cargo_args`); it uses the repository variables and secret of the `remote` job. Note that this
+uploads the project's library artifacts (about 100 to 150 MB for a small project in the debug profile)
+to the cache. Projects tried so far: ripgrep 15.2.0 (no proc macros) and fd 10.5.2 (clap derive, jemalloc);
+see the design doc for results. Untested suggestions for larger ones: bat, hyperfine, rust-analyzer.
 
 **Acceptance test.** `scripts/two-checkout-test.sh [--remote-cache URL]` builds
 `examples/sample-ws` (a registry dependency, a build script, a library, a binary) from two different

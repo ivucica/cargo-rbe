@@ -96,6 +96,10 @@ fi
 echo "== 2. cache hits across checkouts (remote cache: $REMOTE)"
 A2="$T/second/a"; B2="$T/second/b"; mkdir -p "$A2" "$B2"
 cp -r "$ROOT/examples/sample-ws/." "$A2/"; cp -r "$ROOT/examples/sample-ws/." "$B2/"
+# A unique line per run: a cache that already holds entries from an earlier run (a long-lived server,
+# or a second variant in the same job) must still see a miss for the workspace crate in checkout A.
+RUN_ID="$(date +%s%N)-$RANDOM"
+for d in "$A2" "$B2"; do echo "// test-run: $RUN_ID" >> "$d/samplelib/src/lib.rs"; done
 build "$A2" a2 cache a2
 build "$B2" b2 cache b2
 python3 - "$T/log-a2.jsonl" "$T/log-b2.jsonl" <<'PY'
@@ -107,13 +111,16 @@ def show(tag, recs):
         extra = r.get("publish") or r.get("reason") or "; ".join(r.get("notes") or [])
         print(f"  {tag} {r['crate']:<12} {r['outcome']:<20} {extra[:80]}")
 show("A", a); show("B", b)
-cacheable = [r for r in a if r.get("eligible")]
+cacheable_a = [r for r in a if r.get("eligible")]
+cacheable_b = [r for r in b if r.get("eligible")]
 published = [r for r in a if r["outcome"] == "miss_published"]
-hits = [r for r in b if r["outcome"] == "hit"]
-print(f"A published {len(published)} of {len(cacheable)} cacheable units; B restored {len(hits)}")
-if not published: print("FAIL: nothing was published in A"); sys.exit(1)
-if len(hits) != len(published): print("FAIL: B did not restore every unit A published"); sys.exit(1)
-print("PASS: units published in A were restored in B")
+hits_a = [r for r in a if r["outcome"] == "hit"]
+hits_b = [r for r in b if r["outcome"] == "hit"]
+print(f"A: {len(published)} published, {len(hits_a)} already cached, of {len(cacheable_a)} cacheable; B restored {len(hits_b)} of {len(cacheable_b)}")
+if not published: print("FAIL: nothing was published in A (the run-unique crate should always miss)"); sys.exit(1)
+if len(hits_a) + len(published) != len(cacheable_a): print("FAIL: a cacheable unit in A neither hit nor published"); sys.exit(1)
+if len(hits_b) != len(cacheable_b): print("FAIL: B did not restore every cacheable unit"); sys.exit(1)
+print("PASS: every cacheable unit in B was restored (published by A or an earlier run)")
 PY
 OUT_A="$("$(appbin a2 "$A2")")"; OUT_B="$("$(appbin b2 "$B2")")"
 echo "  app output A: $OUT_A"; echo "  app output B: $OUT_B"
