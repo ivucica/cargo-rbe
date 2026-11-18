@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Deploy a pinned, sha256-verified Rust toolchain to a prefix and expose it via PATH,
-# so unmodified scripts (including Claude-provided test scripts from drops) can use it.
+# Expose a suitable Rust toolchain on PATH for unmodified scripts (including Claude-provided
+# test scripts from drops). If the system rustc already satisfies the required version, nothing
+# is installed and the system toolchain is used as-is; otherwise deploy a pinned, sha256-verified
+# toolchain to a prefix.
 #
 # Usage:
 #   rust-toolchain.sh [--prefix DIR] [--version VER] deploy
@@ -21,7 +23,7 @@
 set -euo pipefail
 
 PREFIX=""
-VERSION="${RBE_RUST_VERSION:-1.91.1}"
+VERSION="${RBE_RUST_VERSION:-1.85.1}"   # project minimum (Cargo.toml rust-version); set higher, e.g. 1.91.1, to force a specific version
 WITHOUT="${RBE_RUST_WITHOUT:-rust-docs}"   # components to skip; rust-docs is ~780 MB of HTML, useless for building
 REPLACE="${RBE_RUST_REPLACE:-0}"           # 1 = allowed to delete an existing install dir first (never automatic)
 CMD=""
@@ -46,6 +48,22 @@ except Exception:
 PYEOF
 }
 
+# System toolchain check: if the rustc on PATH already satisfies VERSION, no install is needed.
+system_rustc_version() {
+  command -v rustc >/dev/null 2>&1 || return 1
+  rustc --version 2>/dev/null | awk '{print $2}'
+}
+
+use_system_toolchain() { # true (and prints why) when the system rustc is >= VERSION
+  local sys
+  sys="$(system_rustc_version)" || return 1
+  if [ "$(printf '%s\n%s\n' "$sys" "$VERSION" | sort -V | tail -n1)" = "$sys" ]; then
+    echo "system toolchain $(rustc --version) satisfies >= ${VERSION} — no install needed (set RBE_RUST_VERSION higher to force a specific version)" >&2
+    return 0
+  fi
+  return 1
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX="$2"; shift 2 ;;
@@ -68,6 +86,7 @@ esac
 # rustc and cargo — there is no separate cargo download.
 pinned_sha256() {
   case "${VERSION}-${TARGET}" in
+    "1.85.1-x86_64-unknown-linux-gnu") echo "b7202563a52b47f575b284a5a4794fafd688e39bfe8fd855b5e80129e671cb7f" ;;
     "1.91.1-x86_64-unknown-linux-gnu") echo "1c955c040dd087e4751d15588ddec288b4208bea16f8ec5046c164877e55fff7" ;;
     *) return 1 ;;
   esac
@@ -78,6 +97,7 @@ URL="https://static.rust-lang.org/dist/${TARBALL}"
 BIN_DIR="${PREFIX}/bin"
 
 deploy() {
+  if use_system_toolchain; then return 0; fi
   if [ -x "${BIN_DIR}/rustc" ] && [ "$("${BIN_DIR}/rustc" --version | awk '{print $2}')" = "${VERSION}" ]; then
     echo "already deployed: rust ${VERSION} at ${BIN_DIR}" >&2
     return 0
@@ -161,9 +181,14 @@ deploy() {
 
 case "$CMD" in
   deploy) deploy ;;
-  env) deploy; echo "export PATH=\"${BIN_DIR}:\$PATH\"" ;;
+  env)
+    if use_system_toolchain; then exit 0; fi
+    deploy
+    echo "export PATH=\"${BIN_DIR}:\$PATH\""
+    ;;
   run)
     [ $# -ge 1 ] || { echo "run: missing command" >&2; exit 2; }
+    if use_system_toolchain; then exec "$@"; fi
     deploy
     PATH="${BIN_DIR}:${PATH}" exec "$@"
     ;;

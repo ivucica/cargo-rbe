@@ -26,12 +26,15 @@ case "${1:-all}" in
 esac
 
 section toolchain <<'EOF'
-Install the pinned Rust toolchain if missing (idempotent, sha256-verified):
+Check whether your system Rust is new enough — the project requires >= 1.85:
+  rustc --version    # e.g. "rustc 1.85.1 (4eb161250 2025-03-15) (built from a source tarball)"
+If it is >= 1.85, there is nothing to install — use the system toolchain as-is.
+Otherwise deploy the pinned toolchain (idempotent, sha256-verified; default pin 1.85.1):
   .opencode/skills/rust-toolchain/rust-toolchain.sh deploy
 Put it on PATH for your shell (repeat in each new shell):
   eval "$( .opencode/skills/rust-toolchain/rust-toolchain.sh env )"
 Verify:
-  rustc --version    # expect 1.91.1
+  rustc --version    # expect >= 1.85
 EOF
 
 section build <<'EOF'
