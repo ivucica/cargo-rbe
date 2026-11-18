@@ -2,6 +2,7 @@
 name = "cargo-rbe"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.85"
 description = "Remote Execution API (REAPI) client experiments for Cargo builds (D1: smoke test)"
 publish = false
 
