@@ -1,9 +1,10 @@
 .opencode/*
 !.opencode/plans/
 !.opencode/skills/
-# design originals and import tarballs are archived elsewhere (living doc at repo root; tree unpacked from tarballs)
+# design originals, import tarballs and delivery-wrapper zips are archived elsewhere (living doc at repo root; tree unpacked from tarballs)
 .opencode/plans/cargo-rbe-design.v*.md
 .opencode/plans/*.tar.gz
+.opencode/plans/*.zip
 /target
 /tools/protogen/target
 .cargo-rbe.secrets.toml
