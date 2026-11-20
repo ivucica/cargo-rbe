@@ -155,5 +155,5 @@ if a != "hit": print("FAIL: the same edit in another checkout should hit"); sys.
 print("PASS: edit -> miss+publish; same edit elsewhere -> hit")
 PY
 OUT_A="$("$(appbin a2 "$A2")")"; OUT_B="$("$(appbin b2 "$B2")")"
-[ "$OUT_A" = "answer=43 platform=unix" ] && [ "$OUT_B" = "$OUT_A" ] || { echo "FAIL: unexpected output after the edit: A='$OUT_A' B='$OUT_B'"; exit 1; }
+[ "$OUT_A" = "answer=43 platform=unix native=7" ] && [ "$OUT_B" = "$OUT_A" ] || { echo "FAIL: unexpected output after the edit: A='$OUT_A' B='$OUT_B'"; exit 1; }
 echo "PASS: edited code is what runs ($OUT_A)"

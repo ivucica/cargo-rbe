@@ -12,6 +12,7 @@ name: smoke
 #                         that build one from events (usually the same host as the executor)
 #   RBE_BUILD_METADATA    one KEY=VALUE per line, published in the BuildMetadata event
 #   RBE_RESULTS_URL       template, e.g. https://ui.example.com/invocation/{invocation_id}
+#   RBE_RUN_BUILD_SCRIPT_TEST  set to 'true' to run the build-script test on your executor (its image needs gcc and the same Rust toolchain)
 #   RBE_RUN_WRAPPER_TEST  set to 'true' to also run the wrapper acceptance test against the cache
 # Repository *secret*:
 #   RBE_HEADERS           one or more "name=value" lines sent as gRPC metadata (any header names);
@@ -30,6 +31,10 @@ on:
         description: "Tag or branch of that project (default 15.2.0, for ripgrep)"
         required: false
         default: "15.2.0"
+      project_build_scripts:
+        description: "Build scripts for the project run: off | cache | remote (remote uses the configured executor)"
+        required: false
+        default: "off"
       project_cargo_args:
         description: "cargo arguments for the project run"
         required: false
@@ -41,8 +46,9 @@ permissions:
   contents: read
 
 env:
-  # Pinned so cache keys describe their contents (D1 was verified on 1.91). Bump deliberately.
-  RUST_VERSION: "1.91"
+  # Pinned so cache keys describe their contents. 1.85 is what Debian trixie ships, and the
+  # crate dependencies must keep building on it (rust-version in Cargo.toml). Bump deliberately.
+  RUST_VERSION: "1.85"
   BAZEL_REMOTE_VERSION: "2.6.4"
   LBB_VERSION: "v2.325.0"
 
@@ -153,11 +159,13 @@ jobs:
         run: |
           BIN_DIR="$PWD/bin" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:9092 | tee wrapper-test.log
           { echo "### wrapper acceptance test (local cache-only server)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build-script acceptance test (cache mode)
+        run: BIN_DIR="$PWD/bin" scripts/build-script-test.sh --mode cache --remote-cache grpc://127.0.0.1:9092 | tee build-script-test.log
       - name: Wrapper acceptance test, target directories outside the checkouts
         run: EXTERNAL_TARGET=1 BIN_DIR="$PWD/bin" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:9092 | tee wrapper-test-external-target.log
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: wrapper-test-local-cache-only, path: "wrapper-test.log\nwrapper-test-external-target.log" }
+        with: { name: wrapper-test-local-cache-only, path: "wrapper-test.log\nwrapper-test-external-target.log\nbuild-script-test.log" }
 
   local-buildbuddy:
     # Full stack without secrets or cloud accounts: BuildBuddy server + executor + Redis, run
@@ -189,6 +197,11 @@ jobs:
         run: |
           BIN_DIR="$PWD" scripts/two-checkout-test.sh --remote-cache grpc://127.0.0.1:1985 | tee wrapper-test.log
           { echo "### wrapper acceptance test (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build-script acceptance test, remote execution on the local executor
+        run: |
+          BIN_DIR="$PWD" scripts/build-script-test.sh --mode remote --remote-executor grpc://127.0.0.1:1985 | tee build-script-test-remote.log
+          BIN_DIR="$PWD" scripts/build-script-test.sh --mode cache --remote-cache grpc://127.0.0.1:1985 | tee build-script-test-cache.log
+          { echo "### build-script acceptance tests (local BuildBuddy $LBB_VERSION)"; echo '```'; grep -hE '^(==|PASS|FAIL|  [ABC]:|    )' build-script-test-remote.log build-script-test-cache.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Server and executor logs (on failure)
         if: failure()
         run: scripts/local-buildbuddy.sh logs
@@ -197,7 +210,7 @@ jobs:
         run: scripts/local-buildbuddy.sh stop
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: report-local-buildbuddy, path: "report.json\nsmoke.log\nwrapper-test.log" }
+        with: { name: report-local-buildbuddy, path: "report.json\nsmoke.log\nwrapper-test.log\nbuild-script-test-remote.log\nbuild-script-test-cache.log" }
 
   remote:
     needs: build
@@ -248,16 +261,32 @@ jobs:
           [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
           BIN_DIR="$PWD" scripts/two-checkout-test.sh --remote-cache "${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}" "${args[@]}" | tee wrapper-test.log
           { echo "### wrapper acceptance test (configured cache)"; echo '```'; grep -E '^(==|PASS|FAIL|  [AB] |  edited)' wrapper-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Optional: needs an executor whose image has a C compiler and the same Rust toolchain.
+      - name: Build-script acceptance test against the configured executor
+        if: vars.RBE_RUN_BUILD_SCRIPT_TEST == 'true'
+        run: |
+          args=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
+          [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
+          while IFS= read -r line; do
+            [ -n "$line" ] && args+=(--remote_default_exec_properties="$line")
+          done <<< "$RBE_EXEC_PROPERTIES"
+          BIN_DIR="$PWD" scripts/build-script-test.sh --mode remote --remote-executor "${{ vars.RBE_REMOTE_EXECUTOR }}" --remote-cache "${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}" "${args[@]}" | tee build-script-test.log
+          { echo "### build-script acceptance test (configured executor)"; echo '```'; grep -E '^(==|PASS|FAIL|  [ABC]:|    )' build-script-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Manual runs only: the wrapper on a real project (see scripts/real-project-test.sh).
       - name: Real project against the configured cache
         if: github.event_name == 'workflow_dispatch' && inputs.project_repo != ''
         env:
           CARGO_ARGS: ${{ inputs.project_cargo_args }}
+          BUILD_SCRIPTS: ${{ inputs.project_build_scripts }}
           RESULTS_DIR: real-project-out
         run: |
           args=(--remote_cache="${{ vars.RBE_REMOTE_CACHE || vars.RBE_REMOTE_EXECUTOR }}")
+          args+=(--remote_executor="${{ vars.RBE_REMOTE_EXECUTOR }}")
           args+=(--remote_instance_name="${{ vars.RBE_INSTANCE_NAME }}")
           [ -n "$RBE_HEADERS" ] && args+=(--remote_header=@env:RBE_HEADERS)
+          while IFS= read -r line; do
+            [ -n "$line" ] && args+=(--remote_default_exec_properties="$line")
+          done <<< "$RBE_EXEC_PROPERTIES"
           BIN_DIR="$PWD" scripts/real-project-test.sh "${{ inputs.project_repo }}" "${{ inputs.project_ref }}" "${args[@]}" | tee real-project.log
           { echo "### real project: ${{ inputs.project_repo }} @ ${{ inputs.project_ref }}"; echo '```'; cat real-project-out/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

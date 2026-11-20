@@ -58,7 +58,7 @@ impl Mode {
 // ---------------------------------------------------------------------------------------------
 // paths
 
-fn normalize(p: &Path) -> PathBuf {
+pub(crate) fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -72,7 +72,7 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-fn absolutize(cwd: &Path, s: &str) -> PathBuf {
+pub(crate) fn absolutize(cwd: &Path, s: &str) -> PathBuf {
     let p = Path::new(s);
     normalize(&if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) })
 }
@@ -171,11 +171,11 @@ fn is_compile(args: &[String]) -> bool {
     args.iter().any(|a| a == "--crate-name") && args.iter().any(|a| a.ends_with(".rs")) && !args.iter().any(|a| a.starts_with("--print"))
 }
 
-fn quick_field(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn quick_field(args: &[String], flag: &str) -> Option<String> {
     tokenize_args(args).into_iter().find(|t| t.flag == flag).and_then(|t| t.value)
 }
 
-fn extra_filename(args: &[String]) -> Option<String> {
+pub(crate) fn extra_filename(args: &[String]) -> Option<String> {
     tokenize_args(args).into_iter().filter(|t| t.flag == "-C").filter_map(|t| t.value).find_map(|v| v.strip_prefix("extra-filename=").map(|s| s.to_string()))
 }
 
@@ -209,7 +209,7 @@ struct Plan {
     remap_target: Option<(PathBuf, String)>,
 }
 
-fn registry_root_of(manifest_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn registry_root_of(manifest_dir: &Path) -> Option<PathBuf> {
     manifest_dir
         .ancestors()
         .find(|a| {
@@ -308,6 +308,15 @@ fn rustc_identity(rustc: &Path) -> R<String> {
         return Err("rustc -vV failed".into());
     }
     Ok(sha256_hex(&out.stdout))
+}
+
+/// `<sysroot>/bin` of the rustc Cargo will use: the real compiler binary, not a rustup proxy (a proxy
+/// needs HOME and RUSTUP_HOME, which a remote worker does not have).
+pub fn rustc_sysroot_bin() -> Option<String> {
+    let rustc = std::env::var_os("RUSTC").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rustc"));
+    let out = Command::new(rustc).args(["--print", "sysroot"]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !s.is_empty()).then(|| format!("{s}/bin"))
 }
 
 pub fn rustc_identity_for_launcher() -> Option<String> {
@@ -656,8 +665,10 @@ fn passthrough(rustc: &Path, args: &[OsString]) -> i32 {
     127
 }
 
-/// Run the real rustc, forwarding stderr immediately (Cargo reads it as a stream) while keeping a copy.
-fn run_local(rustc: &Path, args: &[String]) -> (i32, Vec<u8>) {
+/// Run the real rustc, forwarding stderr immediately (Cargo reads it as a stream) while keeping a
+/// copy. `on_line` sees every complete stderr line as it arrives: rustc announces `.rmeta` files this
+/// way before it exits, and Cargo starts dependents at that moment (pipelining).
+fn run_local(rustc: &Path, args: &[String], mut on_line: impl FnMut(&str)) -> (i32, Vec<u8>) {
     let mut child = match Command::new(rustc).args(args).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -668,15 +679,23 @@ fn run_local(rustc: &Path, args: &[String]) -> (i32, Vec<u8>) {
     let mut captured = vec![];
     if let Some(mut err) = child.stderr.take() {
         let mut buf = [0u8; 16 * 1024];
+        let mut pending: Vec<u8> = vec![];
         let stderr = std::io::stderr();
         loop {
             match err.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let mut lock = stderr.lock();
-                    let _ = lock.write_all(&buf[..n]);
-                    let _ = lock.flush();
+                    {
+                        let mut lock = stderr.lock();
+                        let _ = lock.write_all(&buf[..n]);
+                        let _ = lock.flush();
+                    }
                     captured.extend_from_slice(&buf[..n]);
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(i) = pending.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=i).collect();
+                        on_line(String::from_utf8_lossy(&line).trim_end());
+                    }
                 }
             }
         }
@@ -795,11 +814,11 @@ async fn publish(conn: &Conn, instance: &str, plan: &Plan, stderr: &[u8]) -> Res
 // ---------------------------------------------------------------------------------------------
 // log, settings, entry point
 
-fn now_ms() -> u128 {
+pub(crate) fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
-fn write_log(cache: &Path, rec: &Value) {
+pub(crate) fn write_log(cache: &Path, rec: &Value) {
     let path = std::env::var_os("CARGO_RBE_LOG").map(PathBuf::from).unwrap_or_else(|| cache.join("actions.jsonl"));
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -811,7 +830,7 @@ fn write_log(cache: &Path, rec: &Value) {
     }
 }
 
-fn load_settings() -> Settings {
+pub(crate) fn load_settings() -> Settings {
     if let Ok(j) = std::env::var("CARGO_RBE_WRAP_SETTINGS") {
         if let Ok(s) = serde_json::from_str::<Settings>(&j) {
             return s;
@@ -831,6 +850,13 @@ fn mark_down(cache: &Path) {
     let _ = std::fs::write(cache.join("remote-down"), now_ms().to_string());
 }
 
+/// Record the closure of an artifact as soon as rustc announces it (see `run_local`).
+fn record_closure_for_path(plan: &Plan, path: &Path) {
+    if let Ok(bytes) = std::fs::read(path) {
+        write_closure(&plan.cache_dir, &sha256_hex(&bytes), &plan.closure);
+    }
+}
+
 fn record_closure_for_outputs(plan: &Plan) {
     for spec in plan.outputs.iter().filter(|o| o.is_artifact) {
         if let Ok(bytes) = std::fs::read(&spec.real) {
@@ -840,6 +866,10 @@ fn record_closure_for_outputs(plan: &Plan) {
 }
 
 pub fn run() -> i32 {
+    // Started by Cargo as a build script that carries a shim sidecar (see buildscript.rs)?
+    if let Some(sidecar) = crate::buildscript::shim_invocation() {
+        return crate::buildscript::run_shim(&sidecar);
+    }
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     if argv.is_empty() {
         eprintln!("cargo-rbe-wrap: used as RUSTC_WRAPPER; run `cargo-rbe cargo build` (or set RUSTC_WRAPPER=cargo-rbe-wrap)");
@@ -882,6 +912,24 @@ pub fn run() -> i32 {
                 for a in registry_remap_flags(&normalize(Path::new(&m)), &cwd).0 {
                     args_os.push(a.into());
                 }
+            }
+            if crate::buildscript::BsMode::from_env() != crate::buildscript::BsMode::Off && crate::buildscript::is_build_script_compile(&rest) {
+                // Compile it locally, then put the shim in place. For workspace crates the working
+                // directory is remapped too, so that the executable (an input of the build-script
+                // Action) is identical across checkouts; compile diagnostics for such a build.rs then
+                // show /workspace paths, which is why this happens only when build scripts are enabled.
+                let mut real_args: Vec<String> = args_os.iter().map(|a| a.to_string_lossy().to_string()).collect();
+                let in_registry = std::env::var("CARGO_MANIFEST_DIR").ok().and_then(|m| registry_root_of(&normalize(Path::new(&m)))).is_some();
+                if !in_registry && std::env::var("CARGO_RBE_REMAP").unwrap_or_else(|_| "registry".into()) != "none" {
+                    real_args.push(format!("--remap-path-prefix={}=/workspace", cwd.display()));
+                }
+                let (code, _) = run_local(&rustc, &real_args, |_| {});
+                if code == 0 {
+                    if let Err(e) = crate::buildscript::install_shim(&rest, &cwd) {
+                        write_log(&cache, &json!({"ts_ms": now_ms() as u64, "kind": "build_script", "crate": crate_name, "outcome": "bs_shim_failed", "reason": e}));
+                    }
+                }
+                return code;
             }
             return passthrough(&rustc, &args_os);
         }
@@ -935,7 +983,13 @@ pub fn run() -> i32 {
     // miss (or no remote): run rustc locally
     let mut real_args = rest.clone();
     real_args.extend(plan.real_extra_args.iter().cloned());
-    let (code, stderr) = run_local(&rustc, &real_args);
+    let (code, stderr) = run_local(&rustc, &real_args, |line| {
+        if line.contains("\"emit\":\"metadata\"") {
+            if let Some(p) = serde_json::from_str::<Value>(line).ok().and_then(|v| v["artifact"].as_str().map(|s| s.to_string())) {
+                record_closure_for_path(&plan, Path::new(&p));
+            }
+        }
+    });
     if code != 0 {
         rec["notes"] = json!(notes);
         finish(rec, "local_failed", t0);

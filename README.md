@@ -1,4 +1,7 @@
-# cargo-rbe (D2: cache-only rustc wrapper, plus the REAPI smoke test)
+# cargo-rbe (D3: build scripts, the rustc wrapper, and the REAPI smoke test)
+
+Minimum supported Rust: **1.85** (Debian trixie). `rust-version` and `resolver = "3"` keep `cargo update` from
+selecting crate versions that need a newer compiler; CI builds on 1.85.
 
 Experimental. Part of the design in `cargo-rbe-design.md` (Cargo as planner, REAPI as the
 execution and cache layer). D1 contains only the **smoke test**: it exercises the REAPI calls the
@@ -106,6 +109,57 @@ and crates whose dependency closure is unknown (built before the wrapper saw the
 components (toolchain, command, input root, package, deps, closure) so two digests can be compared.
 With `--bes_backend` the log is attached to the invocation and the summary appears as console output.
 
+## Build scripts (D3)
+
+```
+cargo-rbe --config=remote cargo --build-scripts=cache  build     # run locally once, publish, reuse everywhere
+cargo-rbe --config=remote cargo --build-scripts=remote build     # execute on the executor, reuse everywhere
+```
+
+Once libraries are cached, build-script execution dominates builds with native dependencies (fd's jemalloc
+build script was about 94 of 108 seconds). With `--build-scripts` the wrapper also handles them. Cargo offers no
+hook around running a build script, so after rustc compiles `build_script_build` the wrapper moves the real
+executable aside (`*.rbe-real`) and puts a **shim** at its path: a hard link to `cargo-rbe-wrap` (touched so its
+mtime is current, otherwise Cargo thinks the unit is stale; a copy if linking is not possible) plus
+`rbe-shim.json`. When Cargo runs the shim:
+
+1. it builds an Action: the real executable, the package directory (minus `target/`, `.git`), an empty `out/`,
+   and a command that runs it with `OUT_DIR=out` as an output directory;
+2. a cache hit restores `OUT_DIR` and replays the script's stdout/stderr, so Cargo sees exactly what a local run
+   would have printed;
+3. on a miss, `cache` runs the script locally and publishes `OUT_DIR` and the output, `remote` uploads the inputs
+   and executes the Action on the executor (the server also caches the result);
+4. on any problem (server unreachable, missing tool on the worker, non-zero exit, unusable result) the real
+   executable runs locally: a build never fails because of this.
+
+**Environment.** The Action sees only: Cargo's variables (`CARGO_PKG_*`, `CARGO_FEATURE_*`, `CARGO_CFG_*`,
+`CARGO_ENCODED_RUSTFLAGS`, `TARGET`, `HOST`, `PROFILE`, `OPT_LEVEL`, `DEBUG`, `DEP_*`, ...), well-known toolchain variables
+(`CC`, `CXX`, `AR`, `CFLAGS`, `PKG_CONFIG_*`, `SOURCE_DATE_EPOCH`, ...; extend with `--env-passthrough A,B`),
+`RUSTC=rustc`, a fixed `NUM_JOBS`, and a `PATH` of the usual system directories preceded by `--build-script-path`
+(default: the `bin` directory of rustc's sysroot, the real compiler, not a rustup proxy). A value that points into this
+machine's build directories (for example a `DEP_*` variable naming another crate's `OUT_DIR`) makes the script
+ineligible, logged with the reason. After a run, a script that declares `rerun-if-env-changed=NAME` for a variable that
+is set here but was not forwarded is not trusted: the result is discarded and the script runs locally.
+
+**Paths.** A worker's directory layout is unknown, so the command prints its root as a first line and paths in the
+script's output below that root are mapped back to this machine's `OUT_DIR` and package directory. Generated *files* are
+not rewritten, so a script that bakes absolute paths into its outputs bakes the worker's.
+
+**Requirements for `remote`.** The worker image needs `/bin/sh`, the C toolchain the scripts use, and rustc in the
+`PATH` you pass (same version: the toolchain identity is in the key). Select the image with
+`--remote_default_exec_properties` (they are part of the Action). Local-run (`cache`) results are keyed with the C
+compiler's identity (`$CC --version`); remote results use a separate key namespace.
+
+**Limits, stated plainly.** Not detected: scripts that read environment variables without declaring them, files
+outside the package directory, or the network; non-deterministic scripts (timestamps, git hashes) are cached with their
+first result. Use `--build-script-skip pkg1,pkg2` to keep such packages local. `OUT_DIR` over 512 MB is not published.
+A workspace crate's build script is compiled with `--remap-path-prefix` for the working directory when `--build-scripts`
+is on (so the executable is identical across checkouts); compile errors in that `build.rs` then show `/workspace/...`.
+
+Log: records with `"kind":"build_script"` and outcomes `bs_hit`, `bs_remote`, `bs_published`, `bs_local`,
+`bs_fallback` (with the reason), `bs_local_only` (ineligible, with the reason), `bs_local_failed`.
+`scripts/build-script-test.sh --mode cache|remote ...` is the acceptance test (see below).
+
 **On a real project.** `scripts/real-project-test.sh GIT_URL REF [cargo-rbe flags]` clones the project twice
 into different directories (own `CARGO_HOME`, own empty target dir), builds it through the wrapper in
 each, and prints what was cached, what hit, what could not be cached and why, which units missed in the
@@ -133,6 +187,12 @@ target directory per checkout); `EXTERNAL_TARGET=1` puts each checkout's target 
 checkout instead. In CI it runs against a local cache-only server
 and against the local BuildBuddy; set the variable `RBE_RUN_WRAPPER_TEST=true` to run it against your
 configured cache too.
+
+**Build-script acceptance test.** `scripts/build-script-test.sh --mode cache --remote-cache URL` or
+`--mode remote --remote-executor URL` builds the sample (two build scripts, one compiling C with the `cc` crate)
+and checks: scripts go through the shim (published, or executed on the executor with the stages shown); a second
+checkout restores all of them and the C library links and runs; a rebuild runs nothing; editing the C file reruns
+the script and the same edit elsewhere hits; an unreachable server falls back to local runs with a correct binary.
 
 ## Build Event Stream (invocation pages)
 
@@ -239,5 +299,7 @@ The protos are Apache-2.0 licensed (bazelbuild/remote-apis, googleapis).
 | BES: 16 of 16 events acknowledged; invocation record created (command, success, structured command line, metadata, console log chunks, attached report) | locally, BuildBuddy v2.325.0 |
 | BES on BuildBuddy cloud: 16 of 16 events acknowledged, invocation page populated (maintainer's GitHub run and local browser) | maintainer reports |
 | D2 acceptance test: digest stability, publish in A / restore in B, warning replay, Cargo freshness, edit -> miss -> hit elsewhere | locally, against bazel-remote 2.6.4; launcher with BES against BuildBuddy v2.325.0 (2 cacheable units published, 2 restored) |
-| D2 on a real-world project, on BuildBuddy cloud, hit rate and timings on large crates, GitHub Actions run of `wrapper-cache-test` | **not yet** |
+| D3 acceptance test, both modes: cache against bazel-remote and local BuildBuddy; remote on the local BuildBuddy executor (bare runner, same host) | locally |
+| fd v10.5.2 with `--build-scripts=remote`: all 11 build scripts (incl. jemalloc's C build) executed on the executor in checkout A, all 11 restored in B; second build 23 s instead of 108 s | locally |
+| D3 on a real remote worker pool (different image and host than the client), BuildBuddy cloud, the GitHub Actions run of the new jobs | **not yet** |
 | TLS (`grpcs://`), custom headers on a real service | **not yet** |

@@ -294,7 +294,7 @@ The wrapper is fail-closed. It rejects unknown rustc flags, paths it cannot map,
 
 **D2. Cache-only wrapper** (done): `RUSTC_WRAPPER` that computes canonical Action digests, consults `GetActionResult`, executes locally on a miss and publishes the result. Includes the two-checkout acceptance test and the JSONL action log.
 
-**D3 (proposal, after the real-project results).** Build-script execution first: run `build_script_build` as an Action (inputs: the compiled script, the package tree, the filtered environment, the toolchain it probes; outputs: `OUT_DIR` and the parsed directives), through a shim at the path Cargo executes, as described in section 7. That removes the dominant cost in builds with native dependencies and makes the `gen` input of every downstream unit remote-produced. Then proc-macro and link units. Remote execution of one plain rustc unit remains a good first smoke for the worker image, but is no longer the first step.
+**D3. Build scripts** (done): shim, cache and remote execution, fallback to local; see the D3 status above. Remote execution of an ordinary rustc unit remains open.
 
 Later chunks follow the rollout in section 13.
 
@@ -418,6 +418,37 @@ Two bugs of mine surfaced on the way, both in test tooling, and one led to a har
 - A shared `CARGO_TARGET_DIR` and a pre-warmed server each broke the acceptance test earlier; see above.
 
 Where D3 should start, given this: **running build scripts remotely or caching their output** (the biggest remaining cost where native dependencies are built from source, and a prerequisite for remote execution of everything downstream), then **proc-macro and link units** (proc macros are now reproducible, but still compiled locally), then crates with native link flags. Remote execution of a single rustc unit, as proposed before, would show the mechanism but not the largest cost.
+
+### Field results for D2.1 (reported 2026-11-18) and the bug they exposed
+
+Your GitHub Actions real-project run (ripgrep, four vCPUs) showed 24 of 33 libraries published in build A, with nine library units rejected as "dependency closure unknown", cascading up the dependency graph. Root cause: Cargo **pipelines**, starting a dependent as soon as a dependency announces its `.rmeta` on stderr, before the dependency's rustc process exits. The wrapper recorded a unit's dependency closure only at process exit, so on a multi-core machine dependents raced ahead. My sandbox has one CPU, so Cargo ran one job at a time and never exposed it. Reproduced here with `-j8` (18 of 33 published, 15 units "closure unknown"); fixed by recording the closure when the `.rmeta` notification appears, after which `-j8` gives 33 of 33 published and 33 of 33 restored. `scripts/real-project-test.sh` now defaults to `-j8`.
+
+### D3 status (delivered 2026-11-18): build scripts
+
+Contents: `cargo-rbe-D3.tar.gz`. New: the build-script shim and flow (`src/buildscript.rs`), directory-tree collection and restore (`src/tree.rs`), an `Execute` helper, launcher flags `--build-scripts off|cache|remote`, `--build-script-skip`, `--build-script-path`, `--env-passthrough`, a sample crate whose build script compiles C with the `cc` crate, `scripts/build-script-test.sh`, and CI steps for it. The README describes the mechanism, the environment policy, requirements for remote mode and the limits. Also in this drop: the MSRV change (Rust 1.85, see below) and the pipelining fix above.
+
+Verified here against bazel-remote 2.6.4 and a local BuildBuddy v2.325.0 (enterprise server, bare-runner executor on the same host):
+
+- The acceptance test passes in both modes: scripts go through the shim (published, or executed on the executor with stages QUEUED, CACHE_CHECK, EXECUTING, COMPLETED); a second checkout at another path restores all of them including the C library compiled by `cc`, and the binary prints the same output; a rebuild runs nothing; editing the C source reruns the script and the same edit in the other checkout hits; with an unreachable server the build succeeds with local runs and a correct binary.
+- fd v10.5.2 with `--build-scripts=remote`: all 11 build scripts executed on the executor in build A (including jemalloc's C build) and all 11 restored in build B; B restored 56 of 56 libraries as well. Build B took 23 s against 108 s with D2 alone. Build A took 191 s, but that number is not representative: the executor shares one CPU with the client, so remote tasks queue behind each other and behind local compiles (`anyhow`'s trivial script reports 151 s of queueing).
+
+Bugs found while building it, all fixed:
+
+- **Stale-looking executable.** The shim is a hard link to the wrapper binary and inherited its old modification time; Cargo treats a unit as stale when an output is older than a source file, so every rebuild reran the build-script compile. The shim's mtime is now set to the current time (a copy if that is not permitted).
+- **Output paths are relative to the working directory.** I set the working directory to the package, so `out` named `pkg/out` and the server returned no output at all. The working directory is now the input root, and the script changes into the package itself.
+- **A silent failure.** An unfound output directory was skipped without error, leaving `OUT_DIR` empty while reporting success. It is now an error (listing what the server returned), which triggers the local fallback.
+
+Design decisions to know about: a hard link per build script rather than a dedicated shim binary (the wrapper is about 15 MB in release; copies are used where links fail); remote results and local-run results live in different key namespaces, because a local run depends on the local C toolchain; the `rustc` identity is part of every key; `--remap-path-prefix` for the working directory is applied to a workspace crate's build-script compile only when `--build-scripts` is on, because `--remap-path-scope` (which would exclude diagnostics) is nightly-only on 1.85 and 1.91.
+
+Not verified: a real worker pool whose image and host differ from the client (the local executor shares the client's filesystem and toolchain, which hides missing-tool problems), BuildBuddy cloud for build scripts (its default image may lack a C compiler and the same rustc; set `container-image` via exec properties), scripts that probe the system (`pkg-config`, `bindgen` with libclang), large `OUT_DIR`s over a real network (fd's jemalloc restore took about 10 s locally), and the new CI jobs on GitHub Actions.
+
+### MSRV (Rust 1.85)
+
+Applied from your note: `uuid` pinned to 1.26.1 (`cargo update uuid@1.29.2 --precise 1.26.1`), `rust-version = "1.85"` in both manifests, `resolver = "3"` so future `cargo update` stays within it, the sample workspace locked the same way, and CI pinned to 1.85. Verified with a Rust 1.85.1 toolchain: the full workspace builds with `--locked` and the unit tests pass. No code needed changing; all of D3 builds on 1.85 as well.
+
+### Where to go after D3
+
+What is left uncached or local: binaries and tests (links), proc macros (now reproducible but still compiled locally), crates with native link flags, and compile steps of build scripts. Candidates: (1) link and proc-macro units, which needs the linker and native inputs treated as part of the key or the worker image; (2) a long-lived daemon, since a hit costs 130 to 230 ms of mostly connection setup; (3) the precise two-stage input scan; (4) remote execution of ordinary rustc units; (5) transfer volume (a debug build restores 130 to 150 MB). Your results on a real worker pool and a larger project should decide the order.
 
 ### Invocation IDs and results URLs
 

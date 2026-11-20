@@ -63,6 +63,18 @@ struct CargoArgs {
     /// off | digest-only | read-only | cache
     #[arg(long, default_value = "cache")]
     mode: String,
+    /// Build scripts: off | cache (run locally, publish and reuse results) | remote (execute on the executor)
+    #[arg(long = "build-scripts", default_value = "off")]
+    build_scripts: String,
+    /// Comma-separated package names whose build scripts always run locally.
+    #[arg(long = "build-script-skip")]
+    build_script_skip: Option<String>,
+    /// PATH entries added in front of the default PATH of remotely executed build scripts (default: the sysroot bin directory of rustc).
+    #[arg(long = "build-script-path")]
+    build_script_path: Option<String>,
+    /// Extra environment variable names forwarded to build scripts, comma-separated (default: Cargo's own plus well-known toolchain variables such as CC, CFLAGS, PKG_CONFIG_PATH).
+    #[arg(long = "env-passthrough")]
+    env_passthrough: Option<String>,
     /// Path remapping for location-independent artifacts: registry | none
     #[arg(long, default_value = "registry")]
     remap: String,
@@ -271,6 +283,13 @@ fn summarize_log(path: &std::path::Path) -> (Vec<String>, bool) {
 
 async fn run_cargo(s: Settings, a: CargoArgs) -> Result<()> {
     let mode = cargo_rbe::wrap::Mode::parse(&a.mode).ok_or_else(|| anyhow!("--mode must be off, digest-only, read-only or cache"))?;
+    let bs_mode = cargo_rbe::buildscript::BsMode::parse(&a.build_scripts).ok_or_else(|| anyhow!("--build-scripts must be off, cache or remote"))?;
+    if bs_mode == cargo_rbe::buildscript::BsMode::Remote && s.remote_executor.is_none() {
+        return Err(anyhow!("--build-scripts=remote needs --remote_executor (or a config section that sets it)"));
+    }
+    if bs_mode != cargo_rbe::buildscript::BsMode::Off && mode == cargo_rbe::wrap::Mode::Off {
+        return Err(anyhow!("--build-scripts needs --mode other than off"));
+    }
     let invocation_id = uuid::Uuid::new_v4().to_string();
     let wrapper = std::env::current_exe()?.with_file_name("cargo-rbe-wrap");
     if !wrapper.exists() {
@@ -319,9 +338,23 @@ async fn run_cargo(s: Settings, a: CargoArgs) -> Result<()> {
         .env("RUSTC_WRAPPER", &wrapper)
         .env("CARGO_RBE_MODE", &a.mode)
         .env("CARGO_RBE_REMAP", &a.remap)
+        .env("CARGO_RBE_BUILD_SCRIPTS", &a.build_scripts)
         .env("CARGO_RBE_LOG", &log)
         .env("CARGO_RBE_INVOCATION_ID", &invocation_id)
         .env("CARGO_RBE_WRAP_SETTINGS", serde_json::to_string(&s)?);
+    if let Some(v) = &a.build_script_skip {
+        cmd.env("CARGO_RBE_BUILD_SCRIPT_SKIP", v);
+    }
+    if bs_mode == cargo_rbe::buildscript::BsMode::Remote {
+        if let Some(v) = a.build_script_path.clone().or_else(cargo_rbe::wrap::rustc_sysroot_bin) {
+            cmd.env("CARGO_RBE_BUILD_SCRIPT_PATH", v);
+        }
+    } else if let Some(v) = &a.build_script_path {
+        cmd.env("CARGO_RBE_BUILD_SCRIPT_PATH", v);
+    }
+    if let Some(v) = &a.env_passthrough {
+        cmd.env("CARGO_RBE_ENV_PASSTHROUGH", v);
+    }
     if let Some(id) = cargo_rbe::wrap::rustc_identity_for_launcher() {
         cmd.env("CARGO_RBE_RUSTC_ID", id);
     }
