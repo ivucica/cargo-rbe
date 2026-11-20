@@ -113,3 +113,56 @@ Cache mode passes all five phases. Now the real target: remote execution on the 
 Now regression runs against the live BuildBuddy stack: D3 remote and cache modes with the new default `PATH`, then the D2 acceptance tests again.
 
 <!-- note from user: final response is missing because of lack of tokens; however cargo-rbe-design.v8.md has all updates we need. token usage limit resets at 15:40 2026-11-20 --> 
+
+# Continuation
+
+I merged the tarball into the git repository I am maintaining. But did you mean to provide an output (report + next step proposal)? Any outputs you want from GHA?
+
+# Response
+
+Yes, I meant to send a closing report with my proposal for what comes next. My last reply ended with only the file cards, which was a mistake on my part.
+
+**D3 report**
+- **What it does:** `--build-scripts=cache|remote` puts a shim at the path Cargo runs for each build script. A hit restores `OUT_DIR` and replays the script's output. A miss either runs the script locally and publishes it (cache) or executes it on the executor (remote). Any problem falls back to a local run, so a build never fails because of it.
+- **Verified here, on local BuildBuddy and bazel-remote:**
+  - The five-phase acceptance test passes in both modes, including a `cc`-compiled C library.
+  - fd's 11 build scripts, including jemalloc, ran on the executor in the first build and were all restored in the second.
+  - The second fd build took 23 s, down from 108 s with D2 alone.
+  - The first build took 191 s, but that figure isn't representative because the executor shares one CPU with the client.
+- **Bugs found and fixed:**
+  - Your GHA run exposed a pipelining race in D2: dependents started before their dependency's closure was recorded. It reproduces with `-j8`, and 33 of 33 units are now cached.
+  - The shim kept the wrapper binary's old mtime, so Cargo saw it as stale on every rebuild.
+  - REAPI output paths are relative to the working directory, so my `out` pointed at the wrong place.
+  - An empty-output case was reported as success; it is now an error that triggers the fallback.
+- **MSRV:**
+  - The `uuid` pin, `rust-version = "1.85"`, `resolver = "3"` and the CI pin to 1.85 are all in.
+  - A clean build from the tarball on rustc 1.85.1 passes, `--locked`, with 19 unit tests.
+- **Not verified:**
+  - A real worker pool with a different image and host than the client. My local executor shares the client's filesystem, which would hide missing tools.
+  - BuildBuddy cloud for build scripts.
+  - The new CI jobs on GitHub Actions.
+  - Scripts that use `pkg-config` or `bindgen`.
+
+**What I'd like from GitHub Actions** (the artifacts are mainly in the `local-buildbuddy` and `wrapper-cache-test` jobs):
+1. A normal run on the merged repo, which exercises the new jobs on 4-vCPU runners. Please send:
+   - `report-local-buildbuddy`, which now includes `build-script-test-remote.log` and `build-script-test-cache.log`;
+   - `wrapper-test-local-cache-only`, which now includes `build-script-test.log`;
+   - `report-remote`.
+2. Actions → smoke → Run workflow with these inputs: `project_repo=https://github.com/sharkdp/fd.git`, `project_ref=v10.5.2`, `project_build_scripts=cache`. That runs the fd case against your cloud cache. Send the `real-project` artifact (`summary.txt` and the logs).
+3. Optionally set `RBE_RUN_BUILD_SCRIPT_TEST=true` and run again. This is deliberately a probe of your cloud executor: if its default image lacks `gcc` or the same rustc, the log will show `bs_fallback` with the reason. That tells us which `container-image` you need.
+
+Also, please run any larger project you actually care about through the real-project workflow. Its log of what isn't cached, and why, will choose between the options below better than my guesses.
+
+**Next step, D4**
+I propose remote execution of ordinary rustc library units, since that was the original goal. It reuses the D2 Action and would upload the input tree and dependency closure. The worker supplies rustc from the sysroot path, as D3 already does. There is one real design question: REAPI results arrive only when an action finishes, but Cargo pipelines on early `.rmeta` notifications.
+- **D4a:** make Cargo wait for the whole unit. This is simple and loses some pipelining.
+- **D4b:** split each unit into a metadata action and a codegen action, as in the design doc.
+
+I'd do D4a first, measure it, and let D4b follow the numbers.
+
+Alternatives I considered:
+- Caching link and proc-macro units, which is aimed at the biggest local cost in test builds.
+- A long-lived daemon, since a cache hit costs 130–230 ms, mostly connection setup.
+- Cutting transfer volume.
+
+Tell me if you'd rather go a different way.
