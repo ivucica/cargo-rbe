@@ -2,6 +2,7 @@
 name = "cargo-rbe"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.85" # Debian trixie ships 1.85; dependencies must not need more
 description = "Remote Execution API (REAPI) client experiments for Cargo builds (D1: smoke test)"
 publish = false
 
@@ -35,5 +36,6 @@ tonic = { version = "0.12", features = ["tls", "tls-roots", "tls-webpki-roots"] 
 uuid = { version = "1", features = ["v4"] }
 
 [workspace]
+resolver = "3" # MSRV-aware: `cargo update` avoids crate versions needing a newer rustc than rust-version
 members = ["tools/protogen"]
 exclude = ["examples/sample-ws"]

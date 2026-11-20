@@ -33,6 +33,7 @@ impl Interceptor for Meta {
 
 pub type Svc = InterceptedService<Channel, Meta>;
 
+#[derive(Clone)]
 pub struct Conn {
     pub svc: Svc,
     pub url: String,
@@ -310,4 +311,93 @@ pub async fn upload_blobs(conn: &Conn, instance: &str, blobs: &[(re::Digest, Vec
     }
     flush(conn, instance, &mut batch).await?;
     Ok((n, bytes))
+}
+
+pub enum Source {
+    Bytes(Vec<u8>),
+    File(std::path::PathBuf),
+}
+
+/// Like `upload_blobs`, but reads file contents only for blobs the server lacks.
+pub async fn upload_sources(conn: &Conn, instance: &str, items: &[(re::Digest, Source)]) -> Result<(usize, u64)> {
+    let mut uniq: Vec<&(re::Digest, Source)> = vec![];
+    for it in items {
+        if it.0.size_bytes > 0 && !uniq.iter().any(|u| u.0.hash == it.0.hash) {
+            uniq.push(it);
+        }
+    }
+    let missing = conn
+        .cas()
+        .find_missing_blobs(re::FindMissingBlobsRequest { instance_name: instance.into(), blob_digests: uniq.iter().map(|b| b.0.clone()).collect(), digest_function: 0 })
+        .await
+        .context("FindMissingBlobs")?
+        .into_inner()
+        .missing_blob_digests;
+    let mut blobs = vec![];
+    for it in uniq.iter().filter(|b| missing.iter().any(|m| m.hash == b.0.hash)) {
+        let data = match &it.1 {
+            Source::Bytes(b) => b.clone(),
+            Source::File(p) => std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+        };
+        if digest_of(&data).hash != it.0.hash {
+            bail!("{} changed while it was being uploaded", match &it.1 { Source::File(p) => p.display().to_string(), _ => "a blob".into() });
+        }
+        blobs.push((it.0.clone(), data));
+    }
+    upload_blobs(conn, instance, &blobs).await
+}
+
+pub struct ExecOutcome {
+    pub response: re::ExecuteResponse,
+    pub stages: Vec<String>,
+    pub op_name: String,
+}
+
+/// Execute an Action (already uploaded) and wait for the result, re-attaching with WaitExecution if
+/// the stream drops.
+pub async fn execute(conn: &Conn, instance: &str, action: &re::Digest) -> Result<ExecOutcome> {
+    use crate::proto::google::longrunning::operation::Result as OpResult;
+    let mut client = conn.exec();
+    let mut stream = client
+        .execute(re::ExecuteRequest { instance_name: instance.into(), skip_cache_lookup: false, action_digest: Some(action.clone()), ..Default::default() })
+        .await
+        .map_err(|e| anyhow!("Execute: {:?}: {}", e.code(), e.message()))?
+        .into_inner();
+    let (mut stages, mut op_name, mut retries) = (vec![], String::new(), 0);
+    loop {
+        match stream.message().await {
+            Ok(Some(op)) => {
+                if !op.name.is_empty() {
+                    op_name = op.name.clone();
+                }
+                if let Some(m) = &op.metadata {
+                    if m.type_url.ends_with("ExecuteOperationMetadata") {
+                        if let Ok(md) = re::ExecuteOperationMetadata::decode(&m.value[..]) {
+                            let s = re::execution_stage::Value::try_from(md.stage).map(|s| s.as_str_name()).unwrap_or("?");
+                            if stages.last().map(|l: &String| l != s).unwrap_or(true) {
+                                stages.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if op.done {
+                    return match op.result {
+                        Some(OpResult::Response(any)) => Ok(ExecOutcome { response: re::ExecuteResponse::decode(&any.value[..])?, stages, op_name }),
+                        Some(OpResult::Error(st)) => bail!("operation failed: code {} {}", st.code, st.message),
+                        None => bail!("operation done without a result"),
+                    };
+                }
+            }
+            Ok(None) | Err(_) if !op_name.is_empty() && retries < 5 => {
+                retries += 1;
+                stream = client
+                    .wait_execution(re::WaitExecutionRequest { name: op_name.clone() })
+                    .await
+                    .map_err(|e| anyhow!("WaitExecution: {:?}: {}", e.code(), e.message()))?
+                    .into_inner();
+            }
+            Ok(None) => bail!("Execute stream ended before the operation completed"),
+            Err(e) => bail!("Execute stream error: {:?}: {}", e.code(), e.message()),
+        }
+    }
 }

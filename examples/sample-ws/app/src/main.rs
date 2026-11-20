@@ -1,3 +1,3 @@
 fn main() {
-    println!("answer={} platform={}", samplelib::value(), samplelib::describe());
+    println!("answer={} platform={} native={}", samplelib::value(), samplelib::describe(), nativelib::answer());
 }
